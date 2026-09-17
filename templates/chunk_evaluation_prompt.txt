@@ -1,0 +1,57 @@
+You are evaluating one bounded chunk of an OpenAPI specification.
+Return JSON only. Do not use Markdown fences, explanations, or repeat the input specification.
+Evaluate only operations and schemas present in this chunk. Do not invent missing operations or schemas.
+Keep the response compact: omit detailed parameters and responses arrays, and keep each suggestion list to at most three short items.
+
+Return this JSON shape:
+{
+  "operations": [
+    {
+      "operation_id": "operationId or null",
+      "method": "get",
+      "path": "/example",
+      "description_quality": "excellent|good|fair|poor|missing",
+      "parameter_completeness": "excellent|good|fair|poor|missing|not_applicable",
+      "response_completeness": "excellent|good|fair|poor|missing",
+      "enhancement_suggestions": ["short suggestion"]
+    }
+  ],
+  "schemas": [
+    {
+      "schema_name": "SchemaName",
+      "description_quality": "excellent|good|fair|poor|missing",
+      "properties_documented": true,
+      "examples_provided": false,
+      "required_fields_specified": true,
+      "suggestions": ["short suggestion"]
+    }
+  ],
+  "security_schemes": [
+    {
+      "type": "apiKey|http|oauth2|openIdConnect",
+      "name": "scheme name",
+      "description": "short description",
+      "required": true
+    }
+  ],
+  "overall": {
+    "overall_quality": "excellent|good|fair|poor",
+    "completeness_score": 1,
+    "ai_readiness_score": 1,
+    "has_comprehensive_descriptions": false,
+    "has_good_examples": false,
+    "has_proper_error_handling": false,
+    "security_well_defined": false,
+    "major_improvements_needed": [],
+    "minor_improvements_suggested": [],
+    "key_strengths": [],
+    "areas_for_improvement": [],
+    "recommendations": []
+  }
+}
+
+Chunk metadata:
+{{ metadata }}
+
+OpenAPI chunk:
+{{ openapi_spec }}

@@ -738,6 +738,7 @@ class OpenAPIEnhancer:
                 debug=debug,
             )
             self.evaluation_template = self._load_evaluation_template()
+            self.chunk_evaluation_template = self._load_chunk_evaluation_template()
             self.linter = OpenAPILinter()
             logger.info("Initialized OpenAPI enhancer with linting support")
         except Exception as e:
@@ -762,6 +763,26 @@ class OpenAPIEnhancer:
             return template
         except Exception as e:
             logger.error(f"Failed to load evaluation template: {e}")
+            raise
+
+    def _load_chunk_evaluation_template(self) -> Template:
+        """Load the compact prompt used for large-specification chunks."""
+        try:
+            templates_dir = config.get_path("templates_dir", "./templates")
+            template_path = templates_dir / "chunk_evaluation_prompt.txt"
+            if not template_path.exists():
+                raise FileNotFoundError(
+                    f"Chunk evaluation template not found: {template_path}"
+                )
+
+            with open(template_path, "r", encoding="utf-8") as f:
+                template_content = f.read()
+
+            template = Template(template_content)
+            logger.info(f"Loaded chunk evaluation template from {template_path}")
+            return template
+        except Exception as e:
+            logger.error(f"Failed to load chunk evaluation template: {e}")
             raise
 
     def _parse_openapi_spec(
@@ -893,7 +914,10 @@ class OpenAPIEnhancer:
                     "chunk_path_count": len(chunk.paths),
                     "chunk_schema_count": len(chunk.schema_names),
                 }
-                chunk_prompt = self.evaluation_template.render(
+                chunk_template = getattr(
+                    self, "chunk_evaluation_template", self.evaluation_template
+                )
+                chunk_prompt = chunk_template.render(
                     openapi_spec=json.dumps(
                         chunk.spec, ensure_ascii=False, separators=(",", ":")
                     ),
@@ -927,7 +951,7 @@ class OpenAPIEnhancer:
 
         chunk_results = await asyncio.gather(*(evaluate_chunk(chunk) for chunk in chunks))
         evaluation_data = self._merge_chunk_evaluations(
-            [result[0] for result in chunk_results]
+            [result[0] for result in chunk_results], spec_dict=spec_dict
         )
         usage_info = self._merge_usage_info(
             [result[1] for result in chunk_results]
@@ -935,6 +959,15 @@ class OpenAPIEnhancer:
 
         evaluation_data.update(
             {
+                "evaluation_id": str(uuid.uuid4()),
+                "api_title": metadata.get("api_title")
+                or spec_dict.get("info", {}).get("title", "Unknown API"),
+                "api_version": metadata.get("api_version")
+                or spec_dict.get("info", {}).get("version", "unknown"),
+                "openapi_version": metadata.get("openapi_version")
+                or spec_dict.get("openapi", spec_dict.get("swagger", "unknown")),
+                "original_spec_filename": request.original_filename,
+                "original_spec_url": request.original_url,
                 "model": self.llm_client.model,
                 "enhancement_level": request.enhancement_level,
                 "timestamp": datetime.now(),
@@ -994,7 +1027,9 @@ class OpenAPIEnhancer:
 
     @classmethod
     def _merge_chunk_evaluations(
-        cls, evaluations: List[Dict[str, Any]]
+        cls,
+        evaluations: List[Dict[str, Any]],
+        spec_dict: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         first = dict(evaluations[0])
         operation_values: Dict[tuple[str, str], Dict[str, Any]] = {}
@@ -1013,6 +1048,16 @@ class OpenAPIEnhancer:
             for security in evaluation.get("security_schemes", []):
                 key = (security.get("type", ""), security.get("name", ""))
                 security_values.setdefault(key, security)
+
+        source_schemas = (spec_dict or {}).get("components", {}).get("schemas", {})
+        if isinstance(source_schemas, dict):
+            for schema_name, schema_definition in source_schemas.items():
+                schema_values.setdefault(
+                    schema_name,
+                    cls._fallback_schema_evaluation(
+                        schema_name, schema_definition
+                    ),
+                )
 
         overall_inputs = [
             evaluation.get("overall", {})
@@ -1043,7 +1088,55 @@ class OpenAPIEnhancer:
         return merged
 
     @staticmethod
-    def _merge_overall(overalls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _fallback_schema_evaluation(
+        schema_name: str, schema_definition: Any
+    ) -> Dict[str, Any]:
+        """Create a deterministic result when a chunk omits a schema entry."""
+        definition = (
+            schema_definition if isinstance(schema_definition, dict) else {}
+        )
+        properties = definition.get("properties", {})
+        properties = properties if isinstance(properties, dict) else {}
+        properties_documented = all(
+            isinstance(property_definition, dict)
+            and bool(property_definition.get("description"))
+            for property_definition in properties.values()
+        )
+        examples_provided = "example" in definition or "examples" in definition
+        required_fields_specified = "required" in definition or not properties
+        suggestions: List[str] = []
+
+        if not definition.get("description"):
+            suggestions.append("Add a schema description")
+        if properties and not properties_documented:
+            suggestions.append("Document each schema property")
+        if not examples_provided:
+            suggestions.append("Add a realistic schema example")
+        if properties and not required_fields_specified:
+            suggestions.append("Specify required fields")
+
+        return {
+            "schema_name": schema_name,
+            "description_quality": (
+                "good" if definition.get("description") else "missing"
+            ),
+            "properties_documented": properties_documented,
+            "examples_provided": examples_provided,
+            "required_fields_specified": required_fields_specified,
+            "suggestions": suggestions,
+        }
+
+    @staticmethod
+    def _normalize_overall_score(value: Any) -> int:
+        """Keep model-provided overall scores within the public 1-5 contract."""
+        try:
+            score = int(value)
+        except (TypeError, ValueError):
+            score = 1
+        return max(1, min(5, score))
+
+    @classmethod
+    def _merge_overall(cls, overalls: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not overalls:
             raise ValueError("Chunk evaluations did not contain overall results")
 
@@ -1055,11 +1148,19 @@ class OpenAPIEnhancer:
         merged = {
             "overall_quality": quality,
             "completeness_score": round(
-                sum(item.get("completeness_score", 1) for item in overalls)
+                sum(
+                    cls._normalize_overall_score(
+                        item.get("completeness_score", 1)
+                    )
+                    for item in overalls
+                )
                 / len(overalls)
             ),
             "ai_readiness_score": round(
-                sum(item.get("ai_readiness_score", 1) for item in overalls)
+                sum(
+                    cls._normalize_overall_score(item.get("ai_readiness_score", 1))
+                    for item in overalls
+                )
                 / len(overalls)
             ),
         }
@@ -1267,7 +1368,7 @@ class OpenAPIEnhancer:
 
             except (json.JSONDecodeError, ValidationError) as e:
                 logger.error(f"Failed to parse evaluation response: {e}")
-                logger.error(f"Full LLM response saved to: {temp_file_path}")
+                logger.error(f"Full LLM response saved to: {artifact_path}")
                 logger.error(f"Response text preview: {response.text[:500]}...")
                 raise ValueError(f"Invalid evaluation response format: {e}")
 

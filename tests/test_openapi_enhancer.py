@@ -86,6 +86,58 @@ def test_chunk_evaluations_merge_operations_schemas_and_overall_scores() -> None
     assert merged["overall"]["major_improvements_needed"] == ["Add pagination"]
 
 
+def test_chunk_overall_scores_are_clamped_to_public_range() -> None:
+    evaluation = {
+        "overall": {
+            "overall_quality": "excellent",
+            "completeness_score": 8,
+            "ai_readiness_score": 0,
+        }
+    }
+
+    merged = OpenAPIEnhancer._merge_chunk_evaluations([evaluation])
+
+    assert merged["overall"]["completeness_score"] == 5
+    assert merged["overall"]["ai_readiness_score"] == 1
+
+
+def test_chunk_merge_fills_schema_entries_omitted_by_model() -> None:
+    evaluation = {
+        "schemas": [
+            {
+                "schema_name": "User",
+                "description_quality": "good",
+                "properties_documented": True,
+                "examples_provided": True,
+                "required_fields_specified": True,
+            }
+        ],
+        "overall": {
+            "overall_quality": "good",
+            "completeness_score": 4,
+            "ai_readiness_score": 4,
+        },
+    }
+    spec = {
+        "components": {
+            "schemas": {
+                "User": {"description": "A user"},
+                "Order": {"type": "object", "properties": {"id": {}}},
+            }
+        }
+    }
+
+    merged = OpenAPIEnhancer._merge_chunk_evaluations(
+        [evaluation], spec_dict=spec
+    )
+
+    assert [schema["schema_name"] for schema in merged["schemas"]] == [
+        "User",
+        "Order",
+    ]
+    assert merged["schemas"][1]["description_quality"] == "missing"
+
+
 @pytest.mark.asyncio
 async def test_large_specification_uses_multiple_llm_calls_and_merges_results() -> None:
     class FakeLLMClient:
@@ -99,10 +151,6 @@ async def test_large_specification_uses_multiple_llm_calls_and_merges_results() 
             self.calls.append(request)
             path = "/a" if '"/a"' in request.prompt else "/b"
             payload = {
-                "evaluation_id": "chunk-evaluation",
-                "api_title": "Example",
-                "api_version": "1.0.0",
-                "openapi_version": "3.0.3",
                 "operations": [
                     {
                         "method": "get",
@@ -143,6 +191,7 @@ async def test_large_specification_uses_multiple_llm_calls_and_merges_results() 
     enhancer = OpenAPIEnhancer.__new__(OpenAPIEnhancer)
     enhancer.llm_client = fake_client
     enhancer.evaluation_template = Template("{{ openapi_spec }}")
+    enhancer.chunk_evaluation_template = Template("CHUNK {{ openapi_spec }}")
 
     def get_int(key, default):
         return {
@@ -173,3 +222,8 @@ async def test_large_specification_uses_multiple_llm_calls_and_merges_results() 
     assert evaluation.llm_calls_count == 2
     assert {operation.path for operation in evaluation.operations} == {"/a", "/b"}
     assert evaluation.total_tokens == 240
+    assert evaluation.evaluation_id
+    assert evaluation.api_title == "Example"
+    assert evaluation.api_version == "1.0.0"
+    assert evaluation.openapi_version == "3.0.3"
+    assert all(call.prompt.startswith("CHUNK ") for call in fake_client.calls)

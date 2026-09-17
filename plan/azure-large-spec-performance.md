@@ -13,6 +13,15 @@ Azure OpenAI を使った通常サイズの評価性能を維持したまま、�
 - 約 60k token 相当の合成 prompt も HTTP 200、実測 52,506 prompt tokens、5.1 秒で成功した。
 - 現在の回帰テストは 7 件すべて成功している。
 
+## 実データ検証結果
+
+- Kintone REST API（128 paths、204 operations、481 schemas）は 6 chunks に分割された。
+- compact chunk prompt の最大実測入力は約 61,854 tokens で、64k の chunk 上限内だった。
+- 6 requests はすべて HTTP 200、`finish_reason=stop` で完了した。
+- 合計 usage は prompt 322,280 tokens、completion 16,479 tokens、total 338,759 tokens、約 0.951221 USD だった。
+- LLM が返さなかった schema は元仕様から deterministic fallback を生成し、最終結果で 204 operations / 481 schemas を保持する。
+- LLM が 1-5 外の overall score を返した場合は reducer で 1-5 に clamp する。
+
 ## 設計方針
 
 ### 1. 小さい仕様は単一リクエストのままにする
@@ -126,5 +135,6 @@ azure_chunk_cache_dir: ./results/.cache
 1. Phase 0 の proxy A/B とサイズ閾値計測
 2. 高速経路を維持したサイズ判定
 3. 構造化チャンクプランナーと専用モデル出力
-4. 並列実行、ローカル統合、再試行
-5. キャッシュ、再開性、実データ検証
+4. 並列実行とローカル統合
+5. 再試行、キャッシュ、再開性
+6. 実データ検証と運用結果の反映
