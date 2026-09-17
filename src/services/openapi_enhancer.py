@@ -3,16 +3,17 @@ OpenAPI Enhancement Service for evaluating and improving OpenAPI specifications.
 Uses Amazon Bedrock with Anthropic Claude to analyze specs and provide enhancement suggestions.
 """
 
+import asyncio
 import json
 import uuid
 import yaml
 import logging
-import tempfile
 from jinja2 import Template
 from datetime import datetime
 from .config_loader import config
 from typing import Any, Dict, List, Optional
 from .llm_client import get_llm_client, LLMRequest
+from .openapi_chunker import OpenAPIChunk, build_openapi_chunks
 from pydantic import BaseModel, Field, ValidationError
 from ..models.evaluation import (
     OpenAPIEvaluationResult,
@@ -826,6 +827,266 @@ class OpenAPIEnhancer:
             logger.error(f"Failed to extract spec metadata: {e}")
             raise
 
+    def _should_chunk_prompt(self, prompt: str) -> bool:
+        """Keep the existing single-call path for prompts below the Azure limit."""
+        if self.llm_client.provider != "azure":
+            return False
+        max_single_prompt_tokens = config.get_int(
+            "azure_max_single_prompt_tokens", 32_000
+        )
+        estimated_prompt_tokens = max(1, len(prompt) // 4)
+        return (
+            max_single_prompt_tokens > 0
+            and estimated_prompt_tokens > max_single_prompt_tokens
+        )
+
+    async def _evaluate_large_specification(
+        self,
+        spec_dict: Dict[str, Any],
+        metadata: Dict[str, Any],
+        request: EnhancementRequest,
+        linting_results: LintingResult,
+        max_tokens: int,
+        temperature: float,
+    ) -> OpenAPIEvaluationResult:
+        """Evaluate an oversized Azure prompt as bounded, reference-safe chunks."""
+        chunk_prompt_tokens = config.get_int(
+            "azure_chunk_prompt_tokens", 24_000
+        )
+        chunk_overhead_tokens = config.get_int(
+            "azure_chunk_prompt_overhead_tokens", 4_000
+        )
+        chunks = build_openapi_chunks(
+            spec_dict,
+            max_prompt_tokens=chunk_prompt_tokens,
+            prompt_overhead_tokens=chunk_overhead_tokens,
+        )
+        if not chunks:
+            raise ValueError("No evaluable operations or schemas found in specification")
+
+        chunk_max_tokens = min(
+            max_tokens,
+            config.get_int("azure_chunk_max_tokens", 8_192),
+        )
+        max_concurrency = max(
+            1, config.get_int("azure_max_concurrency", 3)
+        )
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        logger.info(
+            "Using chunked Azure evaluation: chunks=%d chunk_prompt_tokens=%d "
+            "chunk_max_tokens=%d max_concurrency=%d",
+            len(chunks),
+            chunk_prompt_tokens,
+            chunk_max_tokens,
+            max_concurrency,
+        )
+
+        async def evaluate_chunk(
+            chunk: OpenAPIChunk,
+        ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+            async with semaphore:
+                chunk_metadata = {
+                    **metadata,
+                    "chunk_index": chunk.index,
+                    "chunk_count": len(chunks),
+                    "chunk_path_count": len(chunk.paths),
+                    "chunk_schema_count": len(chunk.schema_names),
+                }
+                chunk_prompt = self.evaluation_template.render(
+                    openapi_spec=json.dumps(
+                        chunk.spec, ensure_ascii=False, separators=(",", ":")
+                    ),
+                    metadata=chunk_metadata,
+                )
+                chunk_prompt += (
+                    "\n\nThis is evaluation chunk "
+                    f"{chunk.index + 1} of {len(chunks)}. "
+                    "Evaluate only the operations and schemas present in this "
+                    "chunk. Do not invent missing operations or schemas."
+                )
+                logger.info(
+                    "Evaluating chunk %d/%d: paths=%d schemas=%d "
+                    "estimated_tokens=%d",
+                    chunk.index + 1,
+                    len(chunks),
+                    len(chunk.paths),
+                    len(chunk.schema_names),
+                    chunk.estimated_tokens,
+                )
+                response = await self.llm_client.generate_text(
+                    LLMRequest(
+                        prompt=chunk_prompt,
+                        max_tokens=chunk_max_tokens,
+                        temperature=temperature,
+                    )
+                )
+                return self._parse_evaluation_response(response.text), self._usage_info(
+                    response
+                )
+
+        chunk_results = await asyncio.gather(*(evaluate_chunk(chunk) for chunk in chunks))
+        evaluation_data = self._merge_chunk_evaluations(
+            [result[0] for result in chunk_results]
+        )
+        usage_info = self._merge_usage_info(
+            [result[1] for result in chunk_results]
+        )
+
+        evaluation_data.update(
+            {
+                "model": self.llm_client.model,
+                "enhancement_level": request.enhancement_level,
+                "timestamp": datetime.now(),
+                "evaluation_timestamp": datetime.now(),
+            }
+        )
+        evaluation = OpenAPIEvaluationResult(**evaluation_data)
+        evaluation.linting_results = linting_results
+        evaluation.total_tokens = usage_info["tokens"]
+        evaluation.total_cost_usd = usage_info["cost"]
+        evaluation.llm_calls_count = usage_info["calls"]
+        evaluation.evaluation_usage = {
+            "prompt_tokens": usage_info["prompt_tokens"],
+            "completion_tokens": usage_info["completion_tokens"],
+            "total_tokens": usage_info["tokens"],
+            "total_cost_usd": usage_info["cost"],
+            "calls_count": usage_info["calls"],
+        }
+        logger.info(
+            "Chunked evaluation completed: calls=%d prompt_tokens=%d "
+            "completion_tokens=%d",
+            usage_info["calls"],
+            usage_info["prompt_tokens"],
+            usage_info["completion_tokens"],
+        )
+        return evaluation
+
+    @staticmethod
+    def _parse_evaluation_response(response_text: str) -> Dict[str, Any]:
+        response_text = response_text.strip()
+        json_start = response_text.find("{")
+        json_end = response_text.rfind("}") + 1
+        if json_start == -1 or json_end == 0:
+            raise ValueError("No JSON found in response")
+        return json.loads(response_text[json_start:json_end])
+
+    @staticmethod
+    def _usage_info(response: Any) -> Dict[str, Any]:
+        usage = response.usage or {}
+        return {
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "tokens": usage.get("total_tokens", 0),
+            "cost": usage.get("total_cost_usd", 0.0),
+            "calls": 1,
+        }
+
+    @staticmethod
+    def _merge_usage_info(usages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "prompt_tokens": sum(item["prompt_tokens"] for item in usages),
+            "completion_tokens": sum(item["completion_tokens"] for item in usages),
+            "tokens": sum(item["tokens"] for item in usages),
+            "cost": sum(item["cost"] for item in usages),
+            "calls": sum(item["calls"] for item in usages),
+        }
+
+    @classmethod
+    def _merge_chunk_evaluations(
+        cls, evaluations: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        first = dict(evaluations[0])
+        operation_values: Dict[tuple[str, str], Dict[str, Any]] = {}
+        schema_values: Dict[str, Dict[str, Any]] = {}
+        security_values: Dict[tuple[str, str], Dict[str, Any]] = {}
+
+        for evaluation in evaluations:
+            for operation in evaluation.get("operations", []):
+                key = (
+                    str(operation.get("method", "")).lower(),
+                    str(operation.get("path", "")),
+                )
+                operation_values.setdefault(key, operation)
+            for schema in evaluation.get("schemas", []):
+                schema_values.setdefault(schema.get("schema_name", ""), schema)
+            for security in evaluation.get("security_schemes", []):
+                key = (security.get("type", ""), security.get("name", ""))
+                security_values.setdefault(key, security)
+
+        overall_inputs = [
+            evaluation.get("overall", {})
+            for evaluation in evaluations
+            if evaluation.get("overall")
+        ]
+        merged = {
+            key: value
+            for key, value in first.items()
+            if key
+            not in {
+                "operations",
+                "schemas",
+                "security_schemes",
+                "overall",
+            }
+        }
+        merged.update(
+            {
+                "operations": list(operation_values.values()),
+                "schemas": [
+                    schema for name, schema in schema_values.items() if name
+                ],
+                "security_schemes": list(security_values.values()),
+                "overall": cls._merge_overall(overall_inputs),
+            }
+        )
+        return merged
+
+    @staticmethod
+    def _merge_overall(overalls: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not overalls:
+            raise ValueError("Chunk evaluations did not contain overall results")
+
+        quality_rank = {"missing": 1, "poor": 2, "fair": 3, "good": 4, "excellent": 5}
+        quality = min(
+            (item.get("overall_quality", "poor") for item in overalls),
+            key=lambda value: quality_rank.get(value, 1),
+        )
+        merged = {
+            "overall_quality": quality,
+            "completeness_score": round(
+                sum(item.get("completeness_score", 1) for item in overalls)
+                / len(overalls)
+            ),
+            "ai_readiness_score": round(
+                sum(item.get("ai_readiness_score", 1) for item in overalls)
+                / len(overalls)
+            ),
+        }
+        for field in (
+            "has_comprehensive_descriptions",
+            "has_good_examples",
+            "has_proper_error_handling",
+            "security_well_defined",
+        ):
+            merged[field] = all(item.get(field, False) for item in overalls)
+
+        for field in (
+            "major_improvements_needed",
+            "minor_improvements_suggested",
+            "key_strengths",
+            "areas_for_improvement",
+            "recommendations",
+        ):
+            merged[field] = list(
+                dict.fromkeys(
+                    suggestion
+                    for item in overalls
+                    for suggestion in item.get(field, [])
+                )
+            )
+        return merged
+
     async def evaluate_specification(
         self, request: EnhancementRequest
     ) -> OpenAPIEvaluationResult:
@@ -864,6 +1125,16 @@ class OpenAPIEnhancer:
             max_tokens = config.get_int("max_tokens", 4096)
             temperature = config.get_float("temperature", 0.1)
 
+            if self._should_chunk_prompt(evaluation_prompt):
+                return await self._evaluate_large_specification(
+                    spec_dict=spec_dict,
+                    metadata=metadata,
+                    request=request,
+                    linting_results=linting_results,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+
             llm_request = LLMRequest(
                 prompt=evaluation_prompt, max_tokens=max_tokens, temperature=temperature
             )
@@ -875,16 +1146,17 @@ class OpenAPIEnhancer:
 
             response = await self.llm_client.generate_text(llm_request)
 
-            # Save LLM response to temporary file for debugging
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".txt", prefix="llm_response_", delete=False
-            ) as temp_file:
-                temp_file.write(response.text)
-                temp_file_path = temp_file.name
+            # Save LLM response under the workspace runtime directory.
+            artifact_dir = config.get_path(
+                "runtime_artifact_dir", "./results/runtime"
+            )
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            artifact_path = artifact_dir / f"llm_response_{uuid.uuid4().hex}.txt"
+            artifact_path.write_text(response.text, encoding="utf-8")
 
-            logger.info(f"LLM response saved to temporary file: {temp_file_path}")
+            logger.info(f"LLM response saved to runtime artifact: {artifact_path}")
             logger.info(f"Response length: {len(response.text)} characters")
-            logger.info(f"To view the full response, run: cat {temp_file_path}")
+            logger.info(f"To view the full response, run: cat {artifact_path}")
 
             # Log token usage and cost information if available
             usage_info = {"tokens": 0, "cost": 0.0, "calls": 1}

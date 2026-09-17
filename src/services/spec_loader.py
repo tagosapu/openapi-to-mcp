@@ -74,8 +74,11 @@ async def _load_specification(args: argparse.Namespace, filename: Optional[str])
 
 if __name__ == "__main__":
     import sys
-    import tempfile
     import asyncio
+
+    runtime_dir = Path("results/runtime")
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    test_file_path = runtime_dir / "spec_loader_test.yaml"
 
     # List to track all validation failures
     all_validation_failures = []
@@ -95,18 +98,16 @@ paths:
     get:
       summary: Test endpoint
 """
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write(test_content)
-            temp_file = f.name
+        test_file_path.write_text(test_content, encoding="utf-8")
 
-        result = _load_openapi_spec(temp_file)
+        result = _load_openapi_spec(str(test_file_path))
         if "Test API" not in result:
             all_validation_failures.append(
                 "File loading: Test API not found in loaded content"
             )
 
         # Cleanup
-        Path(temp_file).unlink()
+        test_file_path.unlink(missing_ok=True)
 
     except Exception as e:
         all_validation_failures.append(f"File loading error: {e}")
@@ -135,19 +136,17 @@ paths:
                 self.url = url
 
         # Test file loading path
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write(test_content)
-            temp_file = f.name
+        test_file_path.write_text(test_content, encoding="utf-8")
 
         args = MockArgs()
-        result = asyncio.run(_load_specification(args, temp_file))
+        result = asyncio.run(_load_specification(args, str(test_file_path)))
         if "Test API" not in result:
             all_validation_failures.append(
                 "Load specification: Test API not found in loaded content"
             )
 
         # Cleanup
-        Path(temp_file).unlink()
+        test_file_path.unlink(missing_ok=True)
 
     except Exception as e:
         all_validation_failures.append(f"Load specification error: {e}")

@@ -43,8 +43,12 @@ def _configure_diagnostic_file_logging() -> None:
         return
 
     try:
+        diagnostic_path = config.get_path(
+            "diagnostic_log_file", "./logs/aoai_run.log"
+        )
+        diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(
-            config.get_str("diagnostic_log_file", "./aoai_run.log"),
+            diagnostic_path,
             maxBytes=5 * 1024 * 1024,
             backupCount=3,
             encoding="utf-8",

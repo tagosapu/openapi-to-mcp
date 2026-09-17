@@ -10,6 +10,7 @@ Azure OpenAI を使った通常サイズの評価性能を維持したまま、�
 - `gpt-5.4` への送信後 94.9 秒で `APIConnectionError` と `Connection reset by peer` が発生した。
 - スタックトレースには `http_proxy.py` が含まれるため、HTTP プロキシまたは Azure 側の大規模本文処理が切断要因と考えられる。
 - 同一の Azure 設定による短い `generate_text` は HTTP 200、2.4 秒で成功した。
+- 約 60k token 相当の合成 prompt も HTTP 200、実測 52,506 prompt tokens、5.1 秒で成功した。
 - 現在の回帰テストは 7 件すべて成功している。
 
 ## 設計方針
@@ -82,15 +83,23 @@ Azure OpenAI を使った通常サイズの評価性能を維持したまま、�
 ## 設定候補
 
 ```yaml
-azure_max_single_prompt_tokens: 32000
-azure_chunk_prompt_tokens: 24000
+azure_max_single_prompt_tokens: 60000
+azure_chunk_prompt_tokens: 64000
+azure_chunk_max_tokens: 16384
 azure_max_concurrency: 3
 azure_proxy_mode: auto
 azure_chunk_retry_limit: 2
 azure_chunk_cache_dir: ./results/.cache
 ```
 
-初期値は固定仕様ではなく、Phase 0 の実測結果と Azure deployment の TPM/RPM 制限をもとに調整する。
+現時点の初期値は Phase 0 の 60k token canary をもとに設定している。Azure deployment の TPM/RPM 制限と実データの結果を見て調整する。
+
+## 出力先ポリシー
+
+- 診断ログは `./logs/aoai_run.log` に保存する。
+- LLM 応答などのデバッグ用成果物は `./results/runtime/` に保存する。
+- アプリケーションコードと検証コードで OS の既定 temporary directory を出力先にしない。
+- CLI 実行ログを保存する場合も、`logs/` などワークスペース内のパスを使用する。
 
 ## テスト計画
 

@@ -10,6 +10,8 @@ __pycache__/
 *Zone.Identifier
 .env
 input_data/
+logs/
+results/runtime/
 .Python
 build/
 develop-eggs/
