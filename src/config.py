@@ -54,7 +54,7 @@ if __name__ == "__main__":
     logger.info(f"Results dir: {Path('results')}")
 
     # Test config loader access
-    logger.info(f"Model from config.yml: {config.get_str('model')}")
+    logger.info(f"Model from configuration: {config.get_model()}")
     logger.info(f"Max tokens from config.yml: {config.get_int('max_tokens')}")
 
     logger.info("Simplified configuration module test completed successfully")

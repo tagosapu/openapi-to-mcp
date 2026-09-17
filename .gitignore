@@ -7,6 +7,9 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+*Zone.Identifier
+.env
+input_data/
 .Python
 build/
 develop-eggs/

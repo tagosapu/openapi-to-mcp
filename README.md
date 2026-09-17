@@ -127,6 +127,7 @@ These resources show you exactly what to expect from the conversion process and 
 - Valid API credentials for your chosen LLM provider:
   - Amazon Bedrock credentials (for Claude via Bedrock)
   - Anthropic API key (for direct Claude access)
+  - Azure OpenAI API key, endpoint, and API version
 
 ## Installation
 
@@ -232,7 +233,17 @@ export AWS_REGION=us-east-1
 export ANTHROPIC_API_KEY=your-api-key
 ```
 
-Note: The model selection is configured in `config/config.yml`, not through environment variables.
+The model selection is read from `MODEL` when it is set in `.env`. For the direct Azure OpenAI SDK convention, `VISION_MODEL` is used when `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_API_KEY` are set; otherwise the value in `config/config.yml` is used.
+
+#### For Azure OpenAI:
+```bash
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_API_KEY=your-api-key
+VISION_MODEL=your-deployment-name
+AZURE_OPENAI_API_VERSION=2024-10-21
+```
+
+`VISION_MODEL` must match the deployment name configured in Azure OpenAI. The alternative `MODEL=azure/your-deployment-name` format is also supported.
 
 ## Examples
 

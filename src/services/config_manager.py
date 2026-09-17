@@ -7,6 +7,7 @@ Expected output: provider="bedrock"
 """
 
 import logging
+import os
 from pathlib import Path
 from .config_loader import config
 
@@ -15,10 +16,18 @@ logger = logging.getLogger(__name__)
 
 def _detect_provider_from_model(model: str) -> str:
     """Detect provider from model string using LiteLLM conventions."""
-    if model.startswith("bedrock/"):
+    normalized_model = model.strip().lower()
+    if normalized_model.startswith("azure/"):
+        return "azure"
+    elif normalized_model.startswith("bedrock/"):
         return "bedrock"
-    elif "claude" in model.lower() and not model.startswith("bedrock/"):
+    elif "claude" in normalized_model and not normalized_model.startswith("bedrock/"):
         return "anthropic"
+    elif (
+        os.getenv("AZURE_OPENAI_API_KEY")
+        and os.getenv("AZURE_OPENAI_ENDPOINT")
+    ) or (os.getenv("AZURE_API_KEY") and os.getenv("AZURE_API_BASE")):
+        return "azure"
     else:
         # Default to anthropic for unknown models
         logger.warning(
@@ -37,7 +46,7 @@ def _setup_logging(verbose: bool) -> None:
 def _show_environment_info() -> None:
     """Display current environment configuration."""
     try:
-        model = config.get_str("model")
+        model = config.get_model()
         max_tokens = config.get_int("max_tokens", 4096)
         temperature = config.get_float("temperature", 0.1)
         timeout_seconds = config.get_int("timeout_seconds", 300)

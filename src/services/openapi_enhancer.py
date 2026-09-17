@@ -955,7 +955,7 @@ class OpenAPIEnhancer:
                 )
 
                 # Add missing fields to evaluation data
-                model = config.get_str("model")
+                model = self.llm_client.model
                 evaluation_data.update(
                     {
                         "model": model,
@@ -1108,7 +1108,7 @@ class OpenAPIEnhancer:
         """Get statistics about the enhancement service."""
         try:
             model_info = self.llm_client.get_model_info()
-            model = config.get_str("model")
+            model = self.llm_client.model
             max_tokens = config.get_int("max_tokens", 4096)
             temperature = config.get_float("temperature", 0.1)
             templates_dir = config.get_path("templates_dir", "./templates")

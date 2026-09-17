@@ -78,8 +78,12 @@ Examples:
   openapi-to-mcp my-api.yaml --output my-results.json
 
 Note: The LLM provider is automatically detected from the MODEL environment variable:
+- azure/deployment-name -> Azure OpenAI
 - bedrock/model-id → Amazon Bedrock
 - claude-model-name → Anthropic
+
+Azure OpenAI can also use AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, and
+VISION_MODEL, matching the official Azure OpenAI SDK convention.
         """,
     )
 
@@ -178,7 +182,7 @@ def _prepare_execution_context(
         spec_source = f"File: {filename}"
 
     # Get model from config.yml
-    model = config.get_str("model")
+    model = config.get_model()
     output_config = _determine_output_config(args, model, filename)
 
     return filename, spec_source, model, output_config
@@ -426,7 +430,11 @@ def _save_summary_file(
                     param_icon = (
                         "Excellent"
                         if op.parameter_completeness == "excellent"
-                        else "Good" if op.parameter_completeness == "good" else "Poor"
+                        else "Good"
+                        if op.parameter_completeness == "good"
+                        else "N/A"
+                        if op.parameter_completeness == "not_applicable"
+                        else "Poor"
                     )
                     resp_icon = (
                         "Excellent"
@@ -1092,12 +1100,10 @@ async def _execute_cli_workflow(args: argparse.Namespace) -> bool:
         # Load OpenAPI specification
         openapi_spec = await _load_specification(args, filename)
 
-        # Get model parameter from config.yml using config_loader
-        model = config.get_str("model")
         max_tokens = config.get_int("max_tokens")
         temperature = config.get_float("temperature")
 
-        logger.info(f"Using model from config.yml: {model}")
+        logger.info(f"Using model from configuration: {model}")
         logger.info(
             f"Model parameters - max_tokens: {max_tokens}, temperature: {temperature}"
         )

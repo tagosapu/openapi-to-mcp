@@ -3,12 +3,20 @@ Simple LLM client using LiteLLM for unified provider access.
 Supports all LiteLLM-compatible providers through a single interface.
 """
 
-import litellm
+import asyncio
 import logging
+import os
+import time
 from functools import lru_cache
-from .config_loader import config
+from logging.handlers import RotatingFileHandler
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
+
+import litellm
+import openai
+from openai import AzureOpenAI
+
+from .config_loader import config
 
 
 # Configure logging with basicConfig
@@ -23,6 +31,35 @@ logger = logging.getLogger(__name__)
 # Configure LiteLLM with default debug value
 # Will be properly set when LLMClient is initialized
 litellm.set_verbose = False
+
+
+def _configure_diagnostic_file_logging() -> None:
+    """Persist request lifecycle logs without writing prompts or credentials."""
+    root_logger = logging.getLogger()
+    if any(
+        getattr(handler, "_openapi_to_mcp_diagnostic", False)
+        for handler in root_logger.handlers
+    ):
+        return
+
+    try:
+        handler = RotatingFileHandler(
+            config.get_str("diagnostic_log_file", "./aoai_run.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s,p%(process)s,{%(filename)s:%(lineno)d},"
+                "%(levelname)s,%(message)s"
+            )
+        )
+        handler._openapi_to_mcp_diagnostic = True
+        root_logger.addHandler(handler)
+    except OSError as error:
+        logger.warning("Could not create diagnostic log file: %s", error)
 
 
 class LLMRequest(BaseModel):
@@ -59,7 +96,7 @@ class LLMResponse(BaseModel):
 
 
 class LLMClient:
-    """Simple LLM client using LiteLLM for unified provider access."""
+    """LLM client using direct Azure OpenAI or LiteLLM for other providers."""
 
     def __init__(
         self,
@@ -79,10 +116,10 @@ class LLMClient:
             debug: Whether to enable debug mode
         """
         try:
-            import os
+            _configure_diagnostic_file_logging()
 
             # Use passed parameters or fall back to config.yml
-            self.model = model if model is not None else config.get_str("model")
+            self.model = model if model is not None else config.get_model()
             self.max_tokens = (
                 max_tokens
                 if max_tokens is not None
@@ -99,6 +136,12 @@ class LLMClient:
                 else config.get_int("timeout_seconds", 300)
             )
             self.debug = debug if debug is not None else config.get_bool("debug", False)
+            self.azure_deployment = self._get_azure_deployment()
+            self._azure_client = None
+            self.provider = self._get_provider()
+
+            if self.provider == "azure":
+                self._initialize_azure_client()
 
             # Let LiteLLM handle all credential validation
             logger.info(f"Initialized LLM client with model: {self.model}")
@@ -118,6 +161,12 @@ class LLMClient:
             logger.info(
                 f"  ANTHROPIC_API_KEY: {'Set' if os.environ.get('ANTHROPIC_API_KEY') else 'Not set'}"
             )
+            logger.info(
+                f"  AZURE_OPENAI_API_KEY: {'Set' if os.environ.get('AZURE_OPENAI_API_KEY') else 'Not set'}"
+            )
+            logger.info(
+                f"  AZURE_OPENAI_ENDPOINT: {'Set' if os.environ.get('AZURE_OPENAI_ENDPOINT') else 'Not set'}"
+            )
 
         except Exception as e:
             logger.error(f"Failed to initialize LLM client: {e}")
@@ -133,41 +182,117 @@ class LLMClient:
         # but we can add explicit cleanup if needed
         pass
 
-    # Removed _setup_credentials method - letting LiteLLM handle credential validation natively
+    def _get_provider(self) -> str:
+        """Determine whether this client should use direct Azure OpenAI access."""
+        normalized_model = self.model.strip().lower()
+        if normalized_model.startswith("azure/"):
+            return "azure"
+        if normalized_model.startswith("bedrock/"):
+            return "bedrock"
+        if normalized_model.startswith("anthropic/") or "claude" in normalized_model:
+            return "anthropic"
+        if normalized_model.startswith("openai/"):
+            return "openai"
+        if (
+            os.getenv("AZURE_OPENAI_API_KEY")
+            and os.getenv("AZURE_OPENAI_ENDPOINT")
+        ) or (os.getenv("AZURE_API_KEY") and os.getenv("AZURE_API_BASE")):
+            return "azure"
+        return normalized_model.split("/", 1)[0] if "/" in normalized_model else "unknown"
+
+    def _get_azure_deployment(self) -> str:
+        """Get the Azure deployment name without the optional provider prefix."""
+        if self.model.lower().startswith("azure/"):
+            return self.model.split("/", 1)[1]
+        return self.model
+
+    def _initialize_azure_client(self) -> None:
+        """Initialize the official Azure OpenAI client using sibling-project settings."""
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_API_BASE")
+        api_key = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY")
+        api_version = (
+            os.getenv("AZURE_API_VERSION")
+            or os.getenv("AZURE_OPENAI_API_VERSION")
+            or config.get_str("azure_api_version", "2024-10-21")
+        )
+
+        if not endpoint or not api_key:
+            raise ValueError(
+                "Azure OpenAI requires AZURE_OPENAI_ENDPOINT and "
+                "AZURE_OPENAI_API_KEY"
+            )
+
+        os.environ.pop("NO_PROXY", None)
+        os.environ.pop("no_proxy", None)
+
+        self._azure_client = AzureOpenAI(
+            azure_endpoint=endpoint,
+            api_key=api_key,
+            api_version=api_version,
+            timeout=self.timeout_seconds,
+            max_retries=config.get_int("azure_max_retries", 0),
+        )
 
     async def generate_text(self, request: LLMRequest) -> LLMResponse:
         """Generate text using the configured model via LiteLLM."""
+        request_started_at = time.monotonic()
+        prompt_chars = len(request.prompt)
+        estimated_prompt_tokens = max(1, prompt_chars // 4)
         try:
             logger.info(
-                f"Generating text with model: {self.model}, prompt length: {len(request.prompt)}"
+                "LLM request started: provider=%s model=%s prompt_chars=%d "
+                "estimated_prompt_tokens=%d max_completion_tokens=%d timeout_seconds=%d",
+                self.provider,
+                self.model,
+                prompt_chars,
+                estimated_prompt_tokens,
+                request.max_tokens,
+                self.timeout_seconds,
             )
 
-            # Print the prompt for debugging
-            print("=" * 80)
-            print(f"🔵 PROMPT SENT TO {self.model.upper()}:")
-            print("=" * 80)
-            print(request.prompt)
-            print("=" * 80)
+            if estimated_prompt_tokens >= 100_000:
+                logger.warning(
+                    "Large LLM request: estimated prompt size is %d tokens; "
+                    "Azure processing may take several minutes",
+                    estimated_prompt_tokens,
+                )
 
-            # Prepare parameters for LiteLLM
-            params = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": request.prompt}],
-                "max_tokens": request.max_tokens,
-                "temperature": request.temperature,
-                "top_p": request.top_p,
-                "timeout": self.timeout_seconds,
-            }
+            messages = [{"role": "user", "content": request.prompt}]
+            if self.provider == "azure":
+                params = {
+                    "model": self.azure_deployment,
+                    "messages": messages,
+                    "max_completion_tokens": request.max_tokens,
+                }
+                if request.stop_sequences:
+                    params["stop"] = request.stop_sequences
 
-            if request.stop_sequences:
-                params["stop"] = request.stop_sequences
+                logger.info(
+                    "Azure OpenAI request sent: deployment=%s timeout_seconds=%d",
+                    self.azure_deployment,
+                    self.timeout_seconds,
+                )
+                response = await asyncio.to_thread(
+                    self._azure_client.chat.completions.create, **params
+                )
+            else:
+                params = {
+                    "model": self.model,
+                    "messages": messages,
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "top_p": request.top_p,
+                    "timeout": self.timeout_seconds,
+                }
 
-            # Make the API call using LiteLLM
-            logger.info(f"Calling LiteLLM completion with parameters: {params}")
-            response = await litellm.acompletion(**params)
+                if request.stop_sequences:
+                    params["stop"] = request.stop_sequences
+
+                logger.info("LiteLLM request sent: timeout_seconds=%d", self.timeout_seconds)
+                response = await litellm.acompletion(**params)
 
             # Extract response data
-            content = response.choices[0].message.content
+            content = response.choices[0].message.content or ""
             finish_reason = response.choices[0].finish_reason
 
             # Extract usage and cost information
@@ -213,11 +338,14 @@ class LLMClient:
                 text=content, stop_reason=finish_reason, usage=usage, model=self.model
             )
 
-            # Print the completion for debugging
-            print(f"🟢 COMPLETION FROM {self.model.upper()}:")
-            print("=" * 80)
-            print(content)
-            print("=" * 80)
+            elapsed_seconds = time.monotonic() - request_started_at
+            logger.info(
+                "LLM request completed: elapsed_seconds=%.1f response_chars=%d "
+                "finish_reason=%s",
+                elapsed_seconds,
+                len(content),
+                finish_reason,
+            )
 
             # Log usage and cost information
             if usage:
@@ -241,30 +369,73 @@ class LLMClient:
             logger.info("Successfully generated text response")
             return llm_response
 
-        except Exception as e:
-            logger.error(f"Failed to generate text: {e}")
+        except BaseException as e:
+            elapsed_seconds = time.monotonic() - request_started_at
+            status_code = getattr(e, "status_code", None)
+            request_id = getattr(e, "request_id", None)
+            response = getattr(e, "response", None)
+            if response is not None:
+                request_id = request_id or response.headers.get("x-request-id")
+            retry_after = None
+            if response is not None:
+                retry_after = response.headers.get("retry-after")
+
+            logger.exception(
+                "LLM request failed: elapsed_seconds=%.1f provider=%s model=%s "
+                "prompt_chars=%d timeout_seconds=%d error_type=%s error=%s",
+                elapsed_seconds,
+                self.provider,
+                self.model,
+                prompt_chars,
+                self.timeout_seconds,
+                type(e).__name__,
+                e,
+            )
+            logger.error(
+                "LLM API diagnostics: status_code=%s request_id=%s retry_after=%s "
+                "is_timeout=%s is_rate_limit=%s is_connection_error=%s",
+                status_code,
+                request_id,
+                retry_after,
+                isinstance(e, openai.APITimeoutError),
+                isinstance(e, openai.RateLimitError),
+                isinstance(e, openai.APIConnectionError),
+            )
             raise
+        finally:
+            logger.info(
+                "LLM request ended: elapsed_seconds=%.1f",
+                time.monotonic() - request_started_at,
+            )
 
     def test_connection(self) -> bool:
         """Test the connection with a simple request."""
         try:
             logger.info(f"Testing connection for model: {self.model}")
 
-            # Use synchronous version for testing
-            response = litellm.completion(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": "Hello, please respond with 'Connection successful' to test the API.",
-                    }
-                ],
-                max_tokens=50,
-                temperature=0.1,
-                timeout=30,
-            )
+            messages = [
+                {
+                    "role": "user",
+                    "content": "Hello, please respond with 'Connection successful' to test the API.",
+                }
+            ]
+            if self.provider == "azure":
+                response = self._azure_client.chat.completions.create(
+                    model=self.azure_deployment,
+                    messages=messages,
+                    max_completion_tokens=50,
+                    timeout=30,
+                )
+            else:
+                response = litellm.completion(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=50,
+                    temperature=0.1,
+                    timeout=30,
+                )
 
-            content = response.choices[0].message.content
+            content = response.choices[0].message.content or ""
             logger.info(f"Connection test successful: {content[:100]}")
             return True
 
@@ -277,13 +448,9 @@ class LLMClient:
         try:
             # Extract provider from model string using LiteLLM convention
             # LiteLLM uses format: "provider/model_name" or just "model_name"
-            provider = "unknown"
-            if "/" in self.model:
-                provider = self.model.split("/")[0]
-
             model_info = {
                 "model": self.model,
-                "provider": provider,
+                "provider": self.provider,
                 "max_tokens": self.max_tokens,
                 "temperature": self.temperature,
                 "timeout_seconds": self.timeout_seconds,
@@ -340,7 +507,7 @@ def get_llm_client(
         Configured LLM client instance
     """
     # Use provided parameters or fall back to config defaults
-    actual_model = model if model is not None else config.get_str("model")
+    actual_model = model if model is not None else config.get_model()
     actual_max_tokens = (
         max_tokens if max_tokens is not None else config.get_int("max_tokens", 4096)
     )

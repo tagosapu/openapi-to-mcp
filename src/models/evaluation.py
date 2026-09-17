@@ -30,6 +30,17 @@ class QualityScore(str, Enum):
     MISSING = "missing"
 
 
+class ParameterCompletenessScore(str, Enum):
+    """Parameter completeness scores, including operations without parameters."""
+
+    EXCELLENT = "excellent"
+    GOOD = "good"
+    FAIR = "fair"
+    POOR = "poor"
+    MISSING = "missing"
+    NOT_APPLICABLE = "not_applicable"
+
+
 class LintingSeverity(str, Enum):
     """Severity levels for linting issues."""
 
@@ -186,7 +197,7 @@ class OperationEvaluation(BaseModel):
     description_quality: QualityScore = Field(
         description="Quality of operation description"
     )
-    parameter_completeness: QualityScore = Field(
+    parameter_completeness: ParameterCompletenessScore = Field(
         description="Completeness of parameters"
     )
     response_completeness: QualityScore = Field(description="Completeness of responses")

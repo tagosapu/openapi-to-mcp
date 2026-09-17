@@ -8,8 +8,13 @@ Expected output: ConfigLoader instance with loaded configuration
 
 import yaml
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Configure logging with basicConfig
 logging.basicConfig(
@@ -98,6 +103,24 @@ class ConfigLoader:
         """
         value = self.get(key, default)
         return str(value) if value is not None else default
+
+    def get_model(self, default: str = "") -> str:
+        """Get the configured model, including the sibling AOAI convention."""
+        explicit_model = os.getenv("MODEL")
+        if explicit_model:
+            return explicit_model
+
+        azure_configured = (
+            os.getenv("AZURE_OPENAI_API_KEY")
+            and os.getenv("AZURE_OPENAI_ENDPOINT")
+        ) or (os.getenv("AZURE_API_KEY") and os.getenv("AZURE_API_BASE"))
+        deployment = (os.getenv("VISION_MODEL") or "").strip()
+        if azure_configured and deployment:
+            if deployment.lower().startswith("azure/"):
+                return deployment
+            return f"azure/{deployment}"
+
+        return self.get_str("model", default)
 
     def get_int(self, key: str, default: int = 0) -> int:
         """Get integer configuration value.
