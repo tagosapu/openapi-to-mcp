@@ -137,12 +137,55 @@ def test_transfer_schema_rejects_non_opaque_storage_and_text_refs(json_loader) -
     )
 
 
+def test_transfer_schema_rejects_out_of_bounds_geometry(json_loader) -> None:
+    schema = json_loader("schemas/ocr-transfer-v1.json")
+    validator = Draft202012Validator(schema)
+    invalid = {
+        "schema_version": "ocr-transfer/v1",
+        "document": {
+            "document_id": "doc-geometry",
+            "document_type": "invoice",
+            "source_system": "ocr-service-a",
+        },
+        "ocr": {
+            "fields": {
+                "invoice_number": {
+                    "value": "INV-3",
+                    "value_type": "string",
+                    "status": "extracted",
+                    "source": {
+                        "page": 1,
+                        "bbox": [0.0, 0.1, 1.1, 0.9],
+                        "polygon": [[0.0, 0.0], [0.5, -0.2], [1.0, 1.0]],
+                    },
+                }
+            }
+        },
+        "delivery": {
+            "connector_id": "finance-api-prod",
+            "mapping_id": "invoice-v1",
+            "operation": "create",
+            "deduplication_key_path": "/ocr/fields/invoice_number/value",
+        },
+        "metadata": {
+            "tenant_id": "tenant-001",
+            "correlation_id": "corr-geometry",
+        },
+    }
+
+    errors = list(validator.iter_errors(invalid))
+
+    assert any(error.validator == "maximum" for error in errors)
+    assert any(error.validator == "minimum" for error in errors)
+
+
 def test_mapping_schema_restricts_target_locations_schema_refs_and_operations(json_loader) -> None:
     schema = json_loader("schemas/mapping-v1.json")
     validator = Draft202012Validator(schema)
     valid = {
         "mapping_id": "invoice-v1",
         "version": 3,
+        "status": "deprecated",
         "connector_id": "finance-api-prod",
         "document_types": ["invoice"],
         "operations": ["upsert"],
@@ -150,13 +193,21 @@ def test_mapping_schema_restricts_target_locations_schema_refs_and_operations(js
         "target_schema_ref": "openapi:#/components/schemas/InvoiceUpsertRequest",
         "rules": [
             {
+                "rule_id": "invoice-number",
                 "source": "/ocr/fields/invoice_number/value",
                 "target": {
                     "location": "body",
                     "pointer": "/external_id",
                 },
                 "required": True,
-                "on_missing": "error",
+                "on_missing": "omit",
+                "transforms": ["strip"],
+                "default": "fallback",
+                "enum_map": {"INV-001": "external-1"},
+                "condition": {
+                    "source": "/ocr/fields/invoice_number/value",
+                    "operator": "exists",
+                },
             }
         ],
     }
@@ -179,10 +230,28 @@ def test_mapping_schema_restricts_target_locations_schema_refs_and_operations(js
     }
     invalid_ref = {**valid, "target_schema_ref": "finance-invoice-request:2026-09-01"}
     invalid_operation = {**valid, "operations": ["batch_upsert"]}
+    invalid_status = {**valid, "status": "retired"}
+    invalid_on_missing = {
+        **valid,
+        "rules": [{**valid["rules"][0], "on_missing": "skip"}],
+    }
+    missing_rule_id = {
+        **valid,
+        "rules": [
+            {
+                key: value
+                for key, value in valid["rules"][0].items()
+                if key != "rule_id"
+            }
+        ],
+    }
 
     assert any(error.validator == "enum" for error in validator.iter_errors(invalid_location))
     assert any(error.validator == "pattern" for error in validator.iter_errors(invalid_ref))
     assert any(error.validator == "enum" for error in validator.iter_errors(invalid_operation))
+    assert any(error.validator == "enum" for error in validator.iter_errors(invalid_status))
+    assert any(error.validator == "enum" for error in validator.iter_errors(invalid_on_missing))
+    assert any(error.validator == "required" for error in validator.iter_errors(missing_rule_id))
 
 
 def test_openapi_contract_exposes_transfer_and_admin_paths(yaml_loader) -> None:

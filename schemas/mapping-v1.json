@@ -79,12 +79,17 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "rule_id",
         "source",
         "target",
         "required",
         "on_missing"
       ],
       "properties": {
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
         "source": {
           "$ref": "#/$defs/jsonPointer"
         },
@@ -164,10 +169,61 @@
           "type": "string",
           "enum": [
             "error",
-            "skip",
-            "null",
-            "default"
+            "omit",
+            "null"
           ]
+        },
+        "transforms": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "default": true,
+        "enum_map": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          }
+        },
+        "condition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "operator"
+          ],
+          "properties": {
+            "source": {
+              "$ref": "#/$defs/jsonPointer"
+            },
+            "operator": {
+              "type": "string",
+              "enum": [
+                "exists",
+                "equals",
+                "not_equals",
+                "in"
+              ]
+            },
+            "value": true
+          }
         }
       }
     }

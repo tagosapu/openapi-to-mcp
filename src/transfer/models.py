@@ -2,15 +2,25 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 
-JsonPointer = StringConstraints(pattern=r"^(?:|/(?:[^/~]|~0|~1)*)+$")
-OpaqueRef = StringConstraints(
-    pattern=r"^object://[A-Za-z0-9._-]+(?:/[A-Za-z0-9._~!$&'()*+,;=:@%-]+)+$"
-)
+JsonPointer = Annotated[str, StringConstraints(pattern=r"^(?:|/(?:[^/~]|~0|~1)*)+$")]
+OpaqueObjectRef = Annotated[
+    str,
+    StringConstraints(pattern=r"^object://[A-Za-z0-9._-]+(?:/[A-Za-z0-9._~!$&'()*+,;=:@%-]+)+$")]
+ReferenceUri = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9+.-]*://[^\s]+$")]
+UnitIntervalFloat = Annotated[float, Field(ge=0.0, le=1.0)]
+
+
+def _ensure_non_http_reference(value: str, field_name: str) -> str:
+    if value.split("://", 1)[0].lower() in {"http", "https"}:
+        raise ValueError(f"{field_name} must use a non-http reference URI")
+    return value
 
 
 class TransferBaseModel(BaseModel):
@@ -19,8 +29,8 @@ class TransferBaseModel(BaseModel):
 
 class OcrSource(TransferBaseModel):
     page: int | None = Field(default=None, ge=1)
-    bbox: list[float] | None = Field(default=None, min_length=4, max_length=4)
-    polygon: list[list[float]] | None = None
+    bbox: tuple[UnitIntervalFloat, UnitIntervalFloat, UnitIntervalFloat, UnitIntervalFloat] | None = None
+    polygon: list[tuple[UnitIntervalFloat, UnitIntervalFloat]] | None = None
 
 
 class OcrField(TransferBaseModel):
@@ -78,7 +88,7 @@ class DocumentContent(TransferBaseModel):
     media_type: str | None = None
     filename: str | None = None
     sha256: str | None = Field(default=None, pattern=r"^sha256:[A-Fa-f0-9]{64}$")
-    storage_ref: str | None = Field(default=None, min_length=1)
+    storage_ref: OpaqueObjectRef | None = None
 
 
 class OcrDocument(TransferBaseModel):
@@ -91,7 +101,7 @@ class OcrDocument(TransferBaseModel):
 
 class OcrResult(TransferBaseModel):
     languages: list[str] = Field(default_factory=list)
-    text_ref: str | None = Field(default=None, min_length=1)
+    text_ref: OpaqueObjectRef | None = None
     fields: dict[str, OcrField] | None = None
     line_items: list[OcrLineItem] | None = None
 
@@ -155,14 +165,14 @@ class MappingTarget(TransferBaseModel):
 
 
 class MappingCondition(TransferBaseModel):
-    source: str = Field(pattern=r"^(?:|/(?:[^/~]|~0|~1)*)+$")
+    source: JsonPointer
     operator: Literal["exists", "equals", "not_equals", "in"]
     value: Any | None = None
 
 
 class MappingRule(TransferBaseModel):
     rule_id: str = Field(min_length=1)
-    source: str = Field(pattern=r"^(?:|/(?:[^/~]|~0|~1)*)+$")
+    source: JsonPointer
     target: MappingTarget
     required: bool = False
     on_missing: Literal["error", "omit", "null"] = "error"
@@ -192,8 +202,13 @@ class MappingPreview(TransferBaseModel):
 
 
 class AdditionalHeader(TransferBaseModel):
-    name: str = Field(min_length=1)
-    value_ref: str = Field(min_length=1)
+    name: Literal["X-Api-Version"]
+    value_ref: ReferenceUri
+
+    @model_validator(mode="after")
+    def validate_value_ref(self) -> AdditionalHeader:
+        _ensure_non_http_reference(self.value_ref, "value_ref")
+        return self
 
 
 class ConnectorPolicy(TransferBaseModel):
@@ -231,7 +246,7 @@ class OperationSelection(TransferBaseModel):
 class MappingDefinition(TransferBaseModel):
     mapping_id: str = Field(min_length=1)
     version: int = Field(ge=1)
-    status: Literal["draft", "published", "retired"]
+    status: Literal["draft", "published", "deprecated"]
     connector_id: str = Field(min_length=1)
     document_types: list[str] = Field(min_length=1)
     operations: list[Literal["create", "update", "upsert"]] = Field(min_length=1)
@@ -244,14 +259,20 @@ class ConnectorDefinition(TransferBaseModel):
     connector_id: str = Field(min_length=1)
     version: int = Field(ge=1)
     type: Literal["rest-openapi"]
-    display_name: str | None = None
+    display_name: str = Field(min_length=1)
     base_url: AnyHttpUrl
-    spec_ref: str = Field(min_length=1)
+    spec_ref: ReferenceUri
     spec: dict[str, Any]
-    credential_ref: str = Field(min_length=1)
+    credential_ref: ReferenceUri
     additional_headers: list[AdditionalHeader] = Field(default_factory=list)
     operation_bindings: dict[str, OperationBinding]
     policy: ConnectorPolicy
+
+    @model_validator(mode="after")
+    def validate_reference_uris(self) -> ConnectorDefinition:
+        _ensure_non_http_reference(self.spec_ref, "spec_ref")
+        _ensure_non_http_reference(self.credential_ref, "credential_ref")
+        return self
 
 
 class OutboundRequestParts(TransferBaseModel):

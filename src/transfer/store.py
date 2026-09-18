@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -50,6 +50,7 @@ ALLOWED_TRANSITIONS = {
     },
     TransferStatus.DELIVERING: {
         TransferStatus.SUCCEEDED,
+        TransferStatus.PARTIALLY_SUCCEEDED,
         TransferStatus.RETRYING,
         TransferStatus.FAILED,
         TransferStatus.RECONCILIATION_REQUIRED,
@@ -80,6 +81,10 @@ TERMINAL_STATUSES = {
     TransferStatus.FAILED,
     TransferStatus.CANCELLED,
 }
+
+
+class _StaleTransferStateError(RuntimeError):
+    pass
 
 
 class PayloadProtector(Protocol):
@@ -165,10 +170,17 @@ class TransferStore(Protocol):
 
 
 class SqliteTransferStore:
-    def __init__(self, path: Path, protector: PayloadProtector | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        protector: PayloadProtector | None = None,
+        *,
+        idempotency_retention: timedelta | None = None,
+    ) -> None:
         self._path = path
         self._protector = protector
         self._connection: aiosqlite.Connection | None = None
+        self._idempotency_retention = idempotency_retention or timedelta(hours=24)
 
     async def initialize(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -223,8 +235,18 @@ class SqliteTransferStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 completed_at TEXT,
-                PRIMARY KEY (tenant_id, transfer_id),
-                UNIQUE (tenant_id, idempotency_key)
+                PRIMARY KEY (tenant_id, transfer_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS idempotency_keys (
+                tenant_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                transfer_id TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, idempotency_key),
+                FOREIGN KEY (tenant_id, transfer_id) REFERENCES transfers (tenant_id, transfer_id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS transfer_events (
@@ -236,10 +258,12 @@ class SqliteTransferStore:
                 event_type TEXT NOT NULL,
                 detail_json TEXT NOT NULL,
                 correction_ref TEXT,
+                event_order INTEGER NOT NULL,
                 event_hash TEXT NOT NULL,
                 previous_event_hash TEXT,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (tenant_id, event_id),
+                UNIQUE (tenant_id, event_order),
                 FOREIGN KEY (tenant_id, transfer_id) REFERENCES transfers (tenant_id, transfer_id) ON DELETE CASCADE
             );
 
@@ -442,103 +466,128 @@ class SqliteTransferStore:
         mapping_version: int,
     ) -> CreateTransferResult:
         connection = self._require_connection()
+        now = _utc_now()
         request_json = _json_dumps(request.model_dump(mode="json"))
         request_hash = _sha256_hex(request_json)
-        cursor = await connection.execute(
-            """
-            SELECT * FROM transfers
-            WHERE tenant_id = ? AND idempotency_key = ?
-            LIMIT 1
-            """,
-            (tenant_id, idempotency_key),
-        )
-        existing_row = await cursor.fetchone()
-        await cursor.close()
-        if existing_row is not None:
-            if existing_row["request_hash"] != request_hash:
-                raise IdempotencyConflict("idempotency key is already bound to a different request")
-            return CreateTransferResult(
-                record=self._transfer_from_row(existing_row),
-                idempotent_replay=True,
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing_row = await self._get_active_idempotency_row(connection, tenant_id, idempotency_key)
+            if existing_row is not None:
+                expires_at = _parse_datetime(existing_row["expires_at"])
+                if expires_at is not None and expires_at > now:
+                    if existing_row["request_hash"] != request_hash:
+                        raise IdempotencyConflict(
+                            "idempotency key is already bound to a different request"
+                        )
+                    record = await self.get_transfer(tenant_id, existing_row["transfer_id"])
+                    if record is None:
+                        raise NotFoundError("transfer not found for idempotency key")
+                    await connection.commit()
+                    return CreateTransferResult(record=record, idempotent_replay=True)
+                delete_cursor = await connection.execute(
+                    """
+                    DELETE FROM idempotency_keys
+                    WHERE tenant_id = ? AND idempotency_key = ? AND expires_at <= ?
+                    """,
+                    (tenant_id, idempotency_key, _isoformat(now)),
+                )
+                await delete_cursor.close()
+
+            connector = await self.get_connector(
+                tenant_id, request.delivery.connector_id, connector_version
+            )
+            if connector is None:
+                raise NotFoundError("connector version not found for tenant")
+            mapping = await self.get_mapping(tenant_id, request.delivery.mapping_id, mapping_version)
+            if mapping is None:
+                raise NotFoundError("mapping version not found for tenant")
+
+            transfer_id = str(uuid4())
+            idempotency_expires_at = now + self._idempotency_retention
+            record = TransferRecord(
+                transfer_id=transfer_id,
+                tenant_id=tenant_id,
+                status=TransferStatus.ACCEPTED,
+                request=request,
+                connector_id=request.delivery.connector_id,
+                mapping_id=request.delivery.mapping_id,
+                connector_version=connector_version,
+                mapping_version=mapping_version,
+                correlation_id=correlation_id,
+                document_id=request.document.document_id,
+                document_type=request.document.document_type,
+                idempotency_key=idempotency_key,
+                attempt=0,
+                next_retry_at=None,
+                created_at=now,
+                updated_at=now,
+                completed_at=None,
+                result=None,
+                error=None,
             )
 
-        connector = await self.get_connector(
-            tenant_id, request.delivery.connector_id, connector_version
-        )
-        if connector is None:
-            raise NotFoundError("connector version not found for tenant")
-        mapping = await self.get_mapping(tenant_id, request.delivery.mapping_id, mapping_version)
-        if mapping is None:
-            raise NotFoundError("mapping version not found for tenant")
-
-        now = _utc_now()
-        transfer_id = str(uuid4())
-        record = TransferRecord(
-            transfer_id=transfer_id,
-            tenant_id=tenant_id,
-            status=TransferStatus.ACCEPTED,
-            request=request,
-            connector_id=request.delivery.connector_id,
-            mapping_id=request.delivery.mapping_id,
-            connector_version=connector_version,
-            mapping_version=mapping_version,
-            correlation_id=correlation_id,
-            document_id=request.document.document_id,
-            document_type=request.document.document_type,
-            idempotency_key=idempotency_key,
-            attempt=0,
-            next_retry_at=None,
-            created_at=now,
-            updated_at=now,
-            completed_at=None,
-            result=None,
-            error=None,
-        )
-
-        await connection.execute(
-            """
-            INSERT INTO transfers (
-                transfer_id, tenant_id, connector_id, mapping_id, connector_version, mapping_version,
-                correlation_id, document_id, document_type, idempotency_key, idempotency_expires_at,
-                request_hash, request_json, status, attempt, next_retry_at, result_json, error_json,
-                created_at, updated_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                transfer_id,
-                tenant_id,
-                record.connector_id,
-                record.mapping_id,
-                connector_version,
-                mapping_version,
-                correlation_id,
-                record.document_id,
-                record.document_type,
-                idempotency_key,
-                _isoformat(now),
-                request_hash,
-                request_json,
-                record.status.value,
-                record.attempt,
-                None,
-                None,
-                None,
-                _isoformat(now),
-                _isoformat(now),
-                None,
-            ),
-        )
-        await self._append_event(
-            connection,
-            tenant_id=tenant_id,
-            transfer_id=transfer_id,
-            from_status=None,
-            to_status=TransferStatus.ACCEPTED,
-            event_type="created",
-            detail={"correlation_id": correlation_id},
-            created_at=now,
-        )
-        await connection.commit()
+            await connection.execute(
+                """
+                INSERT INTO transfers (
+                    transfer_id, tenant_id, connector_id, mapping_id, connector_version, mapping_version,
+                    correlation_id, document_id, document_type, idempotency_key, idempotency_expires_at,
+                    request_hash, request_json, status, attempt, next_retry_at, result_json, error_json,
+                    created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    transfer_id,
+                    tenant_id,
+                    record.connector_id,
+                    record.mapping_id,
+                    connector_version,
+                    mapping_version,
+                    correlation_id,
+                    record.document_id,
+                    record.document_type,
+                    idempotency_key,
+                    _isoformat(idempotency_expires_at),
+                    request_hash,
+                    request_json,
+                    record.status.value,
+                    record.attempt,
+                    None,
+                    None,
+                    None,
+                    _isoformat(now),
+                    _isoformat(now),
+                    None,
+                ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO idempotency_keys (
+                    tenant_id, idempotency_key, transfer_id, request_hash, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tenant_id,
+                    idempotency_key,
+                    transfer_id,
+                    request_hash,
+                    _isoformat(idempotency_expires_at),
+                    _isoformat(now),
+                ),
+            )
+            await self._append_event(
+                connection,
+                tenant_id=tenant_id,
+                transfer_id=transfer_id,
+                from_status=None,
+                to_status=TransferStatus.ACCEPTED,
+                event_type="created",
+                detail={"correlation_id": correlation_id},
+                created_at=now,
+            )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
         return CreateTransferResult(record=record, idempotent_replay=False)
 
     async def get_transfer(self, tenant_id: str, transfer_id: str) -> TransferRecord | None:
@@ -649,64 +698,78 @@ class SqliteTransferStore:
         detail: dict[str, Any],
     ) -> TransferRecord:
         connection = self._require_connection()
-        row = await self._get_transfer_row_any_tenant(connection, transfer_id)
-        if row is None:
-            raise NotFoundError("transfer not found")
-        if row["tenant_id"] != tenant_id:
-            raise TenantIsolationError("transfer belongs to another tenant")
-        actual = TransferStatus(row["status"])
-        if actual != expected:
-            raise InvalidTransitionError(
-                f"expected {expected.value}, found {actual.value}"
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = await self._get_transfer_row_any_tenant(connection, transfer_id)
+            if row is None:
+                raise NotFoundError("transfer not found")
+            if row["tenant_id"] != tenant_id:
+                raise TenantIsolationError("transfer belongs to another tenant")
+            actual = TransferStatus(row["status"])
+            if actual != expected:
+                raise InvalidTransitionError(
+                    f"expected {expected.value}, found {actual.value}"
+                )
+            if target not in ALLOWED_TRANSITIONS.get(expected, set()):
+                raise InvalidTransitionError(
+                    f"transition {expected.value} -> {target.value} is not allowed"
+                )
+            now = _utc_now()
+            updated = await self._update_transfer_status(
+                connection,
+                row=row,
+                target=target,
+                event_type="transition",
+                detail=detail,
+                now=now,
+                increment_attempt=False,
+                next_retry_at=detail.get("next_retry_at"),
+                result=detail.get("result"),
+                error=detail.get("error"),
             )
-        if target not in ALLOWED_TRANSITIONS.get(expected, set()):
-            raise InvalidTransitionError(
-                f"transition {expected.value} -> {target.value} is not allowed"
-            )
-        now = _utc_now()
-        updated = await self._update_transfer_status(
-            connection,
-            row=row,
-            target=target,
-            event_type="transition",
-            detail=detail,
-            now=now,
-            increment_attempt=False,
-            next_retry_at=detail.get("next_retry_at"),
-            result=detail.get("result"),
-            error=detail.get("error"),
-        )
-        await connection.commit()
-        return updated
+            await connection.commit()
+            return updated
+        except _StaleTransferStateError as exc:
+            await connection.rollback()
+            raise InvalidTransitionError("transfer changed state during transition") from exc
+        except Exception:
+            await connection.rollback()
+            raise
 
     async def recover_inflight(self) -> int:
         connection = self._require_connection()
-        rows_cursor = await connection.execute(
-            "SELECT * FROM transfers WHERE status = ? ORDER BY created_at ASC, transfer_id ASC",
-            (TransferStatus.DELIVERING.value,),
-        )
-        rows = await rows_cursor.fetchall()
-        await rows_cursor.close()
-        if not rows:
-            return 0
-        now = _utc_now()
         await connection.execute("BEGIN IMMEDIATE")
         try:
+            rows_cursor = await connection.execute(
+                "SELECT * FROM transfers WHERE status = ? ORDER BY created_at ASC, transfer_id ASC",
+                (TransferStatus.DELIVERING.value,),
+            )
+            rows = await rows_cursor.fetchall()
+            await rows_cursor.close()
+            if not rows:
+                await connection.commit()
+                return 0
+            now = _utc_now()
+            recovered = 0
             for row in rows:
-                await self._update_transfer_status(
-                    connection,
-                    row=row,
-                    target=TransferStatus.RECONCILIATION_REQUIRED,
-                    event_type="recover",
-                    detail={"reason": "startup recovery"},
-                    now=now,
-                    increment_attempt=False,
-                )
+                try:
+                    await self._update_transfer_status(
+                        connection,
+                        row=row,
+                        target=TransferStatus.RECONCILIATION_REQUIRED,
+                        event_type="recover",
+                        detail={"reason": "startup recovery"},
+                        now=now,
+                        increment_attempt=False,
+                    )
+                except _StaleTransferStateError:
+                    continue
+                recovered += 1
             await connection.commit()
         except Exception:
             await connection.rollback()
             raise
-        return len(rows)
+        return recovered
 
     async def cancel_transfer(
         self, tenant_id: str, transfer_id: str, detail: dict[str, Any]
@@ -843,29 +906,18 @@ class SqliteTransferStore:
         connection = self._require_connection()
         cursor = await connection.execute(
             """
-            SELECT tenant_id, transfer_id, idempotency_key
-            FROM transfers
-            WHERE idempotency_expires_at < ?
-              AND idempotency_key NOT LIKE '%:expired'
+            SELECT tenant_id, idempotency_key
+            FROM idempotency_keys
+            WHERE expires_at < ?
             """,
             (_isoformat(before),),
         )
         rows = await cursor.fetchall()
         await cursor.close()
-        for row in rows:
-            await connection.execute(
-                """
-                UPDATE transfers
-                SET idempotency_key = ?, updated_at = ?
-                WHERE tenant_id = ? AND transfer_id = ?
-                """,
-                (
-                    f"{row['idempotency_key']}:expired:{row['transfer_id']}",
-                    _isoformat(before),
-                    row["tenant_id"],
-                    row["transfer_id"],
-                ),
-            )
+        await connection.execute(
+            "DELETE FROM idempotency_keys WHERE expires_at < ?",
+            (_isoformat(before),),
+        )
         await connection.commit()
         return len(rows)
 
@@ -880,7 +932,7 @@ class SqliteTransferStore:
                 """
                 SELECT * FROM transfer_events
                 WHERE tenant_id = ? AND created_at < ?
-                ORDER BY created_at ASC, event_id ASC
+                ORDER BY created_at ASC, event_order ASC
                 """,
                 (tenant, _isoformat(before)),
             )
@@ -1003,7 +1055,7 @@ class SqliteTransferStore:
         if target in TERMINAL_STATUSES:
             completed_at = _isoformat(now)
 
-        await connection.execute(
+        cursor = await connection.execute(
             """
             UPDATE transfers
             SET status = ?, attempt = ?, next_retry_at = ?, result_json = ?, error_json = ?, updated_at = ?, completed_at = ?
@@ -1022,6 +1074,12 @@ class SqliteTransferStore:
                 current_status.value,
             ),
         )
+        updated_count = cursor.rowcount
+        await cursor.close()
+        if updated_count != 1:
+            raise _StaleTransferStateError(
+                f"transfer {row['transfer_id']} is no longer in {current_status.value}"
+            )
         await self._append_event(
             connection,
             tenant_id=row["tenant_id"],
@@ -1049,6 +1107,7 @@ class SqliteTransferStore:
         created_at: datetime,
         correction_ref: str | None = None,
     ) -> None:
+        event_order = await self._next_event_order(connection, tenant_id)
         previous_hash = await self._latest_event_hash(connection, tenant_id)
         event_id = str(uuid4())
         detail_json = _json_dumps(detail)
@@ -1056,6 +1115,7 @@ class SqliteTransferStore:
             "|".join(
                 [
                     previous_hash or "",
+                    str(event_order),
                     event_id,
                     tenant_id,
                     transfer_id,
@@ -1071,8 +1131,8 @@ class SqliteTransferStore:
             """
             INSERT INTO transfer_events (
                 event_id, tenant_id, transfer_id, from_status, to_status, event_type,
-                detail_json, correction_ref, event_hash, previous_event_hash, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                detail_json, correction_ref, event_order, event_hash, previous_event_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -1083,11 +1143,28 @@ class SqliteTransferStore:
                 event_type,
                 detail_json,
                 correction_ref,
+                event_order,
                 event_hash,
                 previous_hash,
                 _isoformat(created_at),
             ),
         )
+
+    async def _get_active_idempotency_row(
+        self, connection: aiosqlite.Connection, tenant_id: str, idempotency_key: str
+    ) -> aiosqlite.Row | None:
+        cursor = await connection.execute(
+            """
+            SELECT tenant_id, idempotency_key, transfer_id, request_hash, expires_at
+            FROM idempotency_keys
+            WHERE tenant_id = ? AND idempotency_key = ?
+            LIMIT 1
+            """,
+            (tenant_id, idempotency_key),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row
 
     async def _latest_event_hash(
         self, connection: aiosqlite.Connection, tenant_id: str
@@ -1096,7 +1173,7 @@ class SqliteTransferStore:
             """
             SELECT event_hash FROM transfer_events
             WHERE tenant_id = ?
-            ORDER BY created_at DESC, event_id DESC
+            ORDER BY created_at DESC, event_order DESC
             LIMIT 1
             """,
             (tenant_id,),
@@ -1104,6 +1181,17 @@ class SqliteTransferStore:
         row = await cursor.fetchone()
         await cursor.close()
         return None if row is None else row["event_hash"]
+
+    async def _next_event_order(
+        self, connection: aiosqlite.Connection, tenant_id: str
+    ) -> int:
+        cursor = await connection.execute(
+            "SELECT COALESCE(MAX(event_order), 0) AS event_order FROM transfer_events WHERE tenant_id = ?",
+            (tenant_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return int(row["event_order"]) + 1
 
     async def _list_event_tenants(self, connection: aiosqlite.Connection) -> list[str]:
         cursor = await connection.execute("SELECT DISTINCT tenant_id FROM transfer_events")

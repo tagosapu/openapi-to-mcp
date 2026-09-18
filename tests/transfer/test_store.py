@@ -162,6 +162,89 @@ async def test_create_or_get_transfer_is_tenant_scoped_and_detects_hash_conflict
 
 
 @pytest.mark.asyncio
+async def test_create_or_get_transfer_honors_retention_and_allows_reuse_after_expiry(
+    tmp_path, monkeypatch
+) -> None:
+    from src.transfer import store as store_module
+    from src.transfer.errors import IdempotencyConflict
+    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest
+    from src.transfer.store import SqliteTransferStore
+
+    now = datetime(2026, 9, 18, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(store_module, "_utc_now", lambda: now)
+    store = SqliteTransferStore(tmp_path / "retention.sqlite3", idempotency_retention=timedelta(hours=1))
+    await store.initialize()
+    try:
+        await store.save_connector(
+            ConnectorDefinition.model_validate(sample_connector_definition()),
+            tenant_id="tenant-a",
+        )
+        await store.save_mapping(
+            MappingDefinition.model_validate(sample_mapping()),
+            tenant_id="tenant-a",
+        )
+        request = TransferRequest.model_validate(sample_transfer_request())
+
+        created = await store.create_or_get_transfer(
+            tenant_id="tenant-a",
+            idempotency_key="idem-retention",
+            request=request,
+            correlation_id="corr-retention",
+            connector_version=7,
+            mapping_version=3,
+        )
+
+        now = now + timedelta(minutes=30)
+        replay = await store.create_or_get_transfer(
+            tenant_id="tenant-a",
+            idempotency_key="idem-retention",
+            request=request,
+            correlation_id="corr-retention-replay",
+            connector_version=8,
+            mapping_version=4,
+        )
+
+        conflicting_payload = sample_transfer_request()
+        conflicting_payload["ocr"]["fields"]["invoice_number"]["value"] = "INV-CONFLICT"
+        with pytest.raises(IdempotencyConflict):
+            await store.create_or_get_transfer(
+                tenant_id="tenant-a",
+                idempotency_key="idem-retention",
+                request=TransferRequest.model_validate(conflicting_payload),
+                correlation_id="corr-retention-conflict",
+                connector_version=7,
+                mapping_version=3,
+            )
+
+        now = now + timedelta(hours=2)
+        recreated = await store.create_or_get_transfer(
+            tenant_id="tenant-a",
+            idempotency_key="idem-retention",
+            request=request,
+            correlation_id="corr-retention-new",
+            connector_version=7,
+            mapping_version=3,
+        )
+
+        connection = store._require_connection()
+        cursor = await connection.execute(
+            "SELECT idempotency_expires_at FROM transfers WHERE tenant_id = ? AND transfer_id = ?",
+            ("tenant-a", created.record.transfer_id),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+
+        assert created.idempotent_replay is False
+        assert replay.idempotent_replay is True
+        assert replay.record.transfer_id == created.record.transfer_id
+        assert recreated.idempotent_replay is False
+        assert recreated.record.transfer_id != created.record.transfer_id
+        assert row["idempotency_expires_at"] == "2026-09-18T01:00:00Z"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_claim_cancel_and_recover_follow_required_state_machine(store) -> None:
     from src.transfer.models import (
         ConnectorDefinition,
@@ -320,6 +403,268 @@ async def test_recover_inflight_moves_delivering_to_reconciliation_required(stor
     assert recovered == 1
     assert recovered_record is not None
     assert recovered_record.status == TransferStatus.RECONCILIATION_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_transition_rejects_stale_update_without_appending_phantom_event(
+    store, monkeypatch
+) -> None:
+    from src.transfer.errors import InvalidTransitionError
+    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+
+    await store.save_connector(
+        ConnectorDefinition.model_validate(sample_connector_definition()),
+        tenant_id="tenant-a",
+    )
+    await store.save_mapping(
+        MappingDefinition.model_validate(sample_mapping()),
+        tenant_id="tenant-a",
+    )
+    created = await store.create_or_get_transfer(
+        tenant_id="tenant-a",
+        idempotency_key="race-transition",
+        request=TransferRequest.model_validate(sample_transfer_request()),
+        correlation_id="corr-race-transition",
+        connector_version=7,
+        mapping_version=3,
+    )
+    connection = store._require_connection()
+    before_count = (
+        await (await connection.execute("SELECT COUNT(*) FROM transfer_events WHERE tenant_id = ?", ("tenant-a",))).fetchone()
+    )[0]
+    original = store._update_transfer_status
+
+    async def competing_update(*args, **kwargs):
+        await connection.execute(
+            "UPDATE transfers SET status = ?, updated_at = ? WHERE tenant_id = ? AND transfer_id = ?",
+            (
+                TransferStatus.QUEUED.value,
+                "2026-09-18T00:00:00Z",
+                "tenant-a",
+                created.record.transfer_id,
+            ),
+        )
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_update_transfer_status", competing_update)
+
+    with pytest.raises(InvalidTransitionError):
+        await store.transition(
+            "tenant-a",
+            created.record.transfer_id,
+            TransferStatus.ACCEPTED,
+            TransferStatus.VALIDATING,
+            {"reason": "race"},
+        )
+
+    after_count = (
+        await (await connection.execute("SELECT COUNT(*) FROM transfer_events WHERE tenant_id = ?", ("tenant-a",))).fetchone()
+    )[0]
+    refreshed = await store.get_transfer("tenant-a", created.record.transfer_id)
+
+    assert after_count == before_count
+    assert refreshed is not None
+    assert refreshed.status == TransferStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_recover_inflight_skips_stale_rows_without_appending_phantom_event(
+    store, monkeypatch
+) -> None:
+    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+
+    await store.save_connector(
+        ConnectorDefinition.model_validate(sample_connector_definition()),
+        tenant_id="tenant-a",
+    )
+    await store.save_mapping(
+        MappingDefinition.model_validate(sample_mapping()),
+        tenant_id="tenant-a",
+    )
+    payload = sample_transfer_request()
+    payload["document"]["document_id"] = "doc-race-recover"
+    payload["document"]["content"]["storage_ref"] = "object://documents/doc-race-recover"
+    payload["ocr"]["text_ref"] = "object://ocr-text/doc-race-recover"
+    payload["metadata"]["correlation_id"] = "corr-race-recover"
+    created = await store.create_or_get_transfer(
+        tenant_id="tenant-a",
+        idempotency_key="race-recover",
+        request=TransferRequest.model_validate(payload),
+        correlation_id="corr-race-recover",
+        connector_version=7,
+        mapping_version=3,
+    )
+    await store.transition(
+        "tenant-a",
+        created.record.transfer_id,
+        TransferStatus.ACCEPTED,
+        TransferStatus.VALIDATING,
+        {"reason": "validation started"},
+    )
+    await store.transition(
+        "tenant-a",
+        created.record.transfer_id,
+        TransferStatus.VALIDATING,
+        TransferStatus.QUEUED,
+        {"reason": "validated"},
+    )
+    claimed = await store.claim_due_transfer(datetime(2026, 9, 18, tzinfo=UTC))
+
+    assert claimed is not None
+    assert claimed.record.status == TransferStatus.DELIVERING
+
+    connection = store._require_connection()
+    before_count = (
+        await (await connection.execute("SELECT COUNT(*) FROM transfer_events WHERE tenant_id = ?", ("tenant-a",))).fetchone()
+    )[0]
+    original = store._update_transfer_status
+
+    async def competing_recover(*args, **kwargs):
+        await connection.execute(
+            "UPDATE transfers SET status = ?, updated_at = ? WHERE tenant_id = ? AND transfer_id = ?",
+            (
+                TransferStatus.CANCELLATION_REQUESTED.value,
+                "2026-09-18T00:00:00Z",
+                "tenant-a",
+                created.record.transfer_id,
+            ),
+        )
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_update_transfer_status", competing_recover)
+
+    recovered = await store.recover_inflight()
+    after_count = (
+        await (await connection.execute("SELECT COUNT(*) FROM transfer_events WHERE tenant_id = ?", ("tenant-a",))).fetchone()
+    )[0]
+    refreshed = await store.get_transfer("tenant-a", created.record.transfer_id)
+
+    assert recovered == 0
+    assert after_count == before_count
+    assert refreshed is not None
+    assert refreshed.status == TransferStatus.CANCELLATION_REQUESTED
+
+
+@pytest.mark.asyncio
+async def test_transition_allows_partial_success_as_terminal_delivery_result(store) -> None:
+    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+
+    await store.save_connector(
+        ConnectorDefinition.model_validate(sample_connector_definition()),
+        tenant_id="tenant-a",
+    )
+    await store.save_mapping(
+        MappingDefinition.model_validate(sample_mapping()),
+        tenant_id="tenant-a",
+    )
+    payload = sample_transfer_request()
+    payload["document"]["document_id"] = "doc-partial"
+    payload["document"]["content"]["storage_ref"] = "object://documents/doc-partial"
+    payload["ocr"]["text_ref"] = "object://ocr-text/doc-partial"
+    payload["metadata"]["correlation_id"] = "corr-partial"
+    created = await store.create_or_get_transfer(
+        tenant_id="tenant-a",
+        idempotency_key="partial-1",
+        request=TransferRequest.model_validate(payload),
+        correlation_id="corr-partial",
+        connector_version=7,
+        mapping_version=3,
+    )
+    await store.transition(
+        "tenant-a",
+        created.record.transfer_id,
+        TransferStatus.ACCEPTED,
+        TransferStatus.VALIDATING,
+        {"reason": "validation started"},
+    )
+    await store.transition(
+        "tenant-a",
+        created.record.transfer_id,
+        TransferStatus.VALIDATING,
+        TransferStatus.QUEUED,
+        {"reason": "validated"},
+    )
+    claimed = await store.claim_due_transfer(datetime(2026, 9, 18, tzinfo=UTC))
+
+    assert claimed is not None
+
+    updated = await store.transition(
+        "tenant-a",
+        created.record.transfer_id,
+        TransferStatus.DELIVERING,
+        TransferStatus.PARTIALLY_SUCCEEDED,
+        {
+            "result": {
+                "target_resource_id": "target-123",
+                "target_request_id": "request-123",
+                "postcondition_verified": True,
+            },
+            "line_item_summary": {"succeeded": 1, "failed": 1},
+        },
+    )
+
+    assert updated.status == TransferStatus.PARTIALLY_SUCCEEDED
+    assert updated.completed_at is not None
+    assert updated.result is not None
+    assert updated.result.target_resource_id == "target-123"
+
+
+@pytest.mark.asyncio
+async def test_audit_chain_uses_stable_order_for_same_timestamp_events(store, monkeypatch) -> None:
+    from src.transfer import store as store_module
+    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+
+    fixed_now = datetime(2026, 9, 18, 1, 0, tzinfo=UTC)
+    monkeypatch.setattr(store_module, "_utc_now", lambda: fixed_now)
+    await store.save_connector(
+        ConnectorDefinition.model_validate(sample_connector_definition()),
+        tenant_id="tenant-a",
+    )
+    await store.save_mapping(
+        MappingDefinition.model_validate(sample_mapping()),
+        tenant_id="tenant-a",
+    )
+    created = await store.create_or_get_transfer(
+        tenant_id="tenant-a",
+        idempotency_key="audit-order",
+        request=TransferRequest.model_validate(sample_transfer_request()),
+        correlation_id="corr-audit-order",
+        connector_version=7,
+        mapping_version=3,
+    )
+    await store.transition(
+        "tenant-a",
+        created.record.transfer_id,
+        TransferStatus.ACCEPTED,
+        TransferStatus.VALIDATING,
+        {"reason": "validation started"},
+    )
+    await store.transition(
+        "tenant-a",
+        created.record.transfer_id,
+        TransferStatus.VALIDATING,
+        TransferStatus.QUEUED,
+        {"reason": "validated"},
+    )
+
+    connection = store._require_connection()
+    cursor = await connection.execute(
+        "SELECT event_order, event_hash, previous_event_hash FROM transfer_events WHERE tenant_id = ? ORDER BY created_at ASC, event_order ASC",
+        ("tenant-a",),
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+
+    deleted = await store.purge_expired_audit_events(fixed_now + timedelta(seconds=1), tenant_id="tenant-a")
+    checkpoint = await store.get_latest_audit_checkpoint("tenant-a")
+
+    assert [row["event_order"] for row in rows] == [1, 2, 3]
+    assert rows[0]["previous_event_hash"] is None
+    assert rows[1]["previous_event_hash"] == rows[0]["event_hash"]
+    assert rows[2]["previous_event_hash"] == rows[1]["event_hash"]
+    assert deleted == 3
+    assert checkpoint is not None
+    assert checkpoint["deleted_through_hash"] == rows[-1]["event_hash"]
 
 
 @pytest.mark.asyncio
