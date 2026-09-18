@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from src.transfer.openapi_contract import ContractPreflight
@@ -107,7 +108,9 @@ def test_preflight_resolve_target_schema_supports_component_and_operation_reques
                                     "schema": {"$ref": "#/components/schemas/InvoiceResponse"}
                                 }
                             },
-                        }
+                        },
+                        "400": {"description": "Bad request"},
+                        "500": {"description": "Server error"},
                     },
                 }
             }
@@ -142,3 +145,48 @@ def test_preflight_resolve_target_schema_supports_component_and_operation_reques
         "openapi:#/operations/createInvoice/request_schema",
         "createInvoice",
     )["properties"]["external_id"] == {"type": "string"}
+
+
+@pytest.mark.parametrize(
+    ("security", "expected_code"),
+    [
+        (None, "OPERATION_SECURITY_REQUIRED"),
+        ([], "OPERATION_SECURITY_EMPTY"),
+    ],
+)
+def test_preflight_rejects_missing_effective_security_success_schema_and_error_responses(
+    security: list[dict[str, object]] | None,
+    expected_code: str,
+) -> None:
+    spec: dict[str, object] = {
+        "openapi": "3.1.0",
+        "info": {"title": "Spec", "version": "1.0.0"},
+        "servers": [{"url": "https://api.example.com"}],
+        "paths": {
+            "/invoices": {
+                "post": {
+                    "operationId": "createInvoice",
+                    "responses": {
+                        "201": {"description": "Created"},
+                    },
+                }
+            }
+        },
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {"type": "http", "scheme": "bearer"}
+            }
+        },
+    }
+    operation = spec["paths"]["/invoices"]["post"]
+    if security is not None:
+        operation["security"] = security
+
+    result = ContractPreflight().run(spec)
+
+    codes = {issue.code for issue in result.issues}
+    assert result.valid is False
+    assert expected_code in codes
+    assert "SUCCESS_RESPONSE_SCHEMA_MISSING" in codes
+    assert "ERROR_4XX_RESPONSE_MISSING" in codes
+    assert "ERROR_5XX_RESPONSE_MISSING" in codes

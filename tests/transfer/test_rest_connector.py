@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import UTC, datetime, timedelta
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +124,7 @@ def _base_spec(security_scheme: dict[str, Any], *, security_name: str = "auth", 
                             },
                         },
                         "404": {"description": "Not Found"},
+                        "500": {"description": "Server error"},
                     },
                 }
             },
@@ -152,11 +156,12 @@ def _definition(
     version: int = 1,
     operation_name: str = "create",
     policy: dict[str, Any] | None = None,
+    base_url: str = BASE_URL,
 ) -> ConnectorDefinition:
     payload = sample_connector_definition()
     payload["version"] = version
     payload["spec"] = spec
-    payload["base_url"] = BASE_URL
+    payload["base_url"] = base_url
     payload["operation_bindings"] = {
         operation_name: {
             "operation_id": "createInvoice",
@@ -175,6 +180,21 @@ def _definition(
     if policy is not None:
         payload["policy"] = policy
     return ConnectorDefinition.model_validate(payload)
+
+
+class ChunkStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes], *, delay_seconds: float = 0.0) -> None:
+        self._chunks = chunks
+        self._delay_seconds = delay_seconds
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            if self._delay_seconds:
+                await asyncio.sleep(self._delay_seconds)
+            yield chunk
+
+    async def aclose(self) -> None:
+        return None
 
 
 def _parts(*, operation_id: str = "createInvoice", headers: dict[str, str] | None = None) -> OutboundRequestParts:
@@ -253,6 +273,29 @@ async def test_build_request_supports_query_api_key_when_declared() -> None:
     request = await connector.build_request(_parts())
 
     assert "api_key=query-secret" in str(request.url)
+
+
+@pytest.mark.asyncio
+async def test_build_request_preserves_base_url_path_prefix() -> None:
+    from src.transfer.rest_connector import RestOpenApiConnector
+
+    spec = _base_spec({"type": "http", "scheme": "bearer"})
+    spec["servers"] = [{"url": f"{BASE_URL}/v1"}]
+    connector = RestOpenApiConnector(
+        _definition(spec, base_url=f"{BASE_URL}/v1"),
+        MappingEngine(),
+        StaticCredentialResolver(
+            {
+                "vault://connectors/connector-test": {"token": "bearer-token"},
+                "config://headers/x-api-version": {"value": "2026-09-18"},
+            }
+        ),
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(201))),
+    )
+
+    request = await connector.build_request(_parts())
+
+    assert str(request.url) == f"{BASE_URL}/v1/invoices?document_id=doc-001"
 
 
 @pytest.mark.asyncio
@@ -376,6 +419,115 @@ async def test_send_rejects_redirects_and_response_size_limit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_enforces_streaming_response_size_limit_before_full_buffering() -> None:
+    from src.transfer.rest_connector import RestOpenApiConnector
+
+    connector = RestOpenApiConnector(
+        _definition(
+            _base_spec({"type": "http", "scheme": "bearer"}),
+            policy={
+                "connect_timeout_seconds": 5,
+                "read_timeout_seconds": 30,
+                "total_timeout_seconds": 60,
+                "max_response_bytes": 8,
+                "max_redirects": 0,
+            },
+        ),
+        MappingEngine(),
+        StaticCredentialResolver(
+            {
+                "vault://connectors/connector-test": {"token": "bearer-token"},
+                "config://headers/x-api-version": {"value": "2026-09-18"},
+            }
+        ),
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-type": "application/json"},
+                    stream=ChunkStream([b'{"id":', b'"inv-001"}']),
+                )
+            )
+        ),
+    )
+
+    outcome = await connector.send(await connector.build_request(_parts()))
+
+    assert outcome.delivery_state == "received"
+    assert connector.classify_error(outcome).code == "RESPONSE_TOO_LARGE"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(201, headers={"content-type": "application/json"}, content=b"{"),
+        httpx.Response(201, json={"id": 123}),
+    ],
+)
+async def test_send_marks_unparseable_or_schema_invalid_success_body_as_unknown(
+    response: httpx.Response,
+) -> None:
+    from src.transfer.rest_connector import RestOpenApiConnector
+
+    connector = RestOpenApiConnector(
+        _definition(_base_spec({"type": "http", "scheme": "bearer"})),
+        MappingEngine(),
+        StaticCredentialResolver(
+            {
+                "vault://connectors/connector-test": {"token": "bearer-token"},
+                "config://headers/x-api-version": {"value": "2026-09-18"},
+            }
+        ),
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response)),
+    )
+
+    outcome = await connector.send(await connector.build_request(_parts()))
+
+    assert outcome.delivery_state == "unknown"
+    assert connector.classify_error(outcome).code == "RESPONSE_FORMAT_UNKNOWN"
+
+
+@pytest.mark.asyncio
+async def test_send_applies_total_deadline_to_response_body_read() -> None:
+    from src.transfer.rest_connector import RestOpenApiConnector
+
+    connector = RestOpenApiConnector(
+        _definition(
+            _base_spec({"type": "http", "scheme": "bearer"}),
+            policy={
+                "connect_timeout_seconds": 5,
+                "read_timeout_seconds": 5,
+                "total_timeout_seconds": 0.01,
+                "max_response_bytes": 1024,
+                "max_redirects": 0,
+            },
+        ),
+        MappingEngine(),
+        StaticCredentialResolver(
+            {
+                "vault://connectors/connector-test": {"token": "bearer-token"},
+                "config://headers/x-api-version": {"value": "2026-09-18"},
+            }
+        ),
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-type": "application/json"},
+                    stream=ChunkStream([b'{"id":"', b'inv-001"}'], delay_seconds=0.02),
+                )
+            )
+        ),
+    )
+
+    outcome = await connector.send(await connector.build_request(_parts()))
+
+    assert outcome.delivery_state == "unknown"
+    assert connector.classify_error(outcome).code == "DELIVERY_UNKNOWN"
+
+
+@pytest.mark.asyncio
 async def test_send_and_classify_timeout_unknown_429_and_5xx() -> None:
     from src.transfer.rest_connector import RestOpenApiConnector
 
@@ -400,10 +552,16 @@ async def test_send_and_classify_timeout_unknown_429_and_5xx() -> None:
     assert connector.classify_error(timeout_outcome).code == "DELIVERY_UNKNOWN"
 
     rate_limited = connector.classify_error(
-        connector._build_outcome(httpx.Response(429, headers={"Retry-After": "7"}, json={"detail": "slow down"}))
+        connector._build_outcome(
+            httpx.Response(429, headers={"Retry-After": "7"}, json={"detail": "slow down"}),
+            body_bytes=httpx.Response(429, headers={"Retry-After": "7"}, json={"detail": "slow down"}).content,
+        )
     )
     server_error = connector.classify_error(
-        connector._build_outcome(httpx.Response(503, json={"detail": "down"}))
+        connector._build_outcome(
+            httpx.Response(503, json={"detail": "down"}),
+            body_bytes=httpx.Response(503, json={"detail": "down"}).content,
+        )
     )
 
     assert rate_limited.retryable is True
@@ -456,7 +614,8 @@ async def test_parse_response_rejects_invalid_result_id() -> None:
         httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(201))),
     )
     connector._last_operation_id = "createInvoice"
-    outcome = connector._build_outcome(httpx.Response(201, json={"id": ""}))
+    response = httpx.Response(201, json={"id": ""})
+    outcome = connector._build_outcome(response, body_bytes=response.content)
 
     with pytest.raises(ValueError, match="RESPONSE_ID_INVALID"):
         connector.parse_response(outcome)
@@ -502,6 +661,183 @@ async def test_reconcile_returns_registered_not_registered_or_unknown(
     )
 
     assert result.state == expected_state
+
+
+@pytest.mark.asyncio
+async def test_reconcile_coerces_integer_lookup_path_value() -> None:
+    from src.transfer.connector import ReconciliationContext
+    from src.transfer.rest_connector import RestOpenApiConnector
+
+    observed_paths: list[str] = []
+    spec = _base_spec({"type": "http", "scheme": "bearer"})
+    spec["paths"] = {
+        "/invoices": spec["paths"]["/invoices"],
+        "/lookup/{invoiceId}": {
+            "get": {
+                "operationId": "getInvoice",
+                "security": [{"auth": []}],
+                "parameters": [
+                    {
+                        "name": "invoiceId",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "integer"},
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Found",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/InvoiceResponse"}
+                            }
+                        },
+                    },
+                    "404": {"description": "Not found"},
+                    "500": {"description": "Server error"},
+                },
+            }
+        },
+    }
+    connector = RestOpenApiConnector(
+        _definition(spec),
+        MappingEngine(),
+        StaticCredentialResolver(
+            {
+                "vault://connectors/connector-test": {"token": "bearer-token"},
+                "config://headers/x-api-version": {"value": "2026-09-18"},
+            }
+        ),
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: observed_paths.append(request.url.path) or httpx.Response(404)
+            )
+        ),
+    )
+
+    result = await connector.reconcile(
+        ReconciliationContext(
+            transfer_id="tr-1",
+            idempotency_key="idem-1",
+            deduplication_value="123",
+            operation_id="createInvoice",
+            mode="unknown",
+            target_resource_id=None,
+        )
+    )
+
+    assert result.state == "not_registered"
+    assert observed_paths == ["/lookup/123"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_coerces_boolean_lookup_query_value() -> None:
+    from src.transfer.connector import ReconciliationContext
+    from src.transfer.rest_connector import RestOpenApiConnector
+
+    observed_queries: list[str] = []
+    spec = _base_spec({"type": "http", "scheme": "bearer"})
+    spec["paths"] = {
+        "/invoices": spec["paths"]["/invoices"],
+        "/lookup": {
+            "get": {
+                "operationId": "getInvoice",
+                "security": [{"auth": []}],
+                "parameters": [
+                    {
+                        "name": "enabled",
+                        "in": "query",
+                        "required": True,
+                        "schema": {"type": "boolean"},
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Found",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/InvoiceResponse"}
+                            }
+                        },
+                    },
+                    "404": {"description": "Not found"},
+                    "500": {"description": "Server error"},
+                },
+            }
+        },
+    }
+    payload = _definition(spec).model_dump(mode="json")
+    payload["operation_bindings"]["create"]["lookup_parameter_name"] = "enabled"
+    payload["operation_bindings"]["create"]["lookup_parameter_location"] = "query"
+    connector = RestOpenApiConnector(
+        ConnectorDefinition.model_validate(payload),
+        MappingEngine(),
+        StaticCredentialResolver(
+            {
+                "vault://connectors/connector-test": {"token": "bearer-token"},
+                "config://headers/x-api-version": {"value": "2026-09-18"},
+            }
+        ),
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: observed_queries.append(request.url.query.decode()) or httpx.Response(404)
+            )
+        ),
+    )
+
+    result = await connector.reconcile(
+        ReconciliationContext(
+            transfer_id="tr-1",
+            idempotency_key="idem-1",
+            deduplication_value="true",
+            operation_id="createInvoice",
+            mode="unknown",
+            target_resource_id=None,
+        )
+    )
+
+    assert result.state == "not_registered"
+    assert observed_queries == ["enabled=true"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejects_invalid_lookup_value_without_dispatch() -> None:
+    from src.transfer.connector import ReconciliationContext
+    from src.transfer.rest_connector import RestOpenApiConnector
+
+    dispatched = False
+    spec = _base_spec({"type": "http", "scheme": "bearer"})
+    spec["paths"]["/invoices/{invoiceId}"]["get"]["parameters"][0]["schema"] = {"type": "integer"}
+    async def never_called(request: httpx.Request) -> httpx.Response:
+        nonlocal dispatched
+        dispatched = True
+        return httpx.Response(200)
+
+    connector = RestOpenApiConnector(
+        _definition(spec),
+        MappingEngine(),
+        StaticCredentialResolver(
+            {
+                "vault://connectors/connector-test": {"token": "bearer-token"},
+                "config://headers/x-api-version": {"value": "2026-09-18"},
+            }
+        ),
+        httpx.AsyncClient(transport=httpx.MockTransport(never_called)),
+    )
+
+    result = await connector.reconcile(
+        ReconciliationContext(
+            transfer_id="tr-1",
+            idempotency_key="idem-1",
+            deduplication_value='"not-an-int"',
+            operation_id="createInvoice",
+            mode="unknown",
+            target_resource_id=None,
+        )
+    )
+
+    assert result.state == "unknown"
+    assert dispatched is False
 
 
 @pytest.mark.asyncio
@@ -592,6 +928,69 @@ async def test_registry_is_tenant_scoped_and_version_pinned(tmp_path: Path) -> N
         assert pinned.operation_id == "createInvoice"
         with pytest.raises(NotFoundError):
             await registry.get("tenant-b", "connector-test")
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda spec, payload: spec["components"]["schemas"]["InvoiceUpsertRequest"]["required"].append("document_id"),
+        lambda spec, payload: spec["components"]["securitySchemes"].__setitem__("auth", {"type": "http", "scheme": "basic"}),
+        lambda spec, payload: payload.__setitem__("display_name", "Connector Test Updated"),
+    ],
+)
+async def test_registry_rejects_same_version_material_changes_but_allows_identical_reregistration(
+    tmp_path: Path,
+    mutate,
+) -> None:
+    from src.transfer.rest_connector import ConnectorRegistry
+    from src.transfer.store import SqliteTransferStore
+
+    store = SqliteTransferStore(tmp_path / "registry-immutability.sqlite3")
+    await store.initialize()
+    try:
+        registry = ConnectorRegistry(
+            store,
+            StaticCredentialResolver(
+                {
+                    "vault://connectors/connector-test": {"token": "bearer-token"},
+                    "config://headers/x-api-version": {"value": "2026-09-18"},
+                    "config://headers/x-region": {"value": "jp-east"},
+                    "key://tests/transfer": {"value": Fernet.generate_key().decode("ascii")},
+                }
+            ),
+            settings_factory(allowed_hosts=["93.184.216.34"]),
+        )
+        original = _definition(_base_spec({"type": "http", "scheme": "bearer"}), version=1)
+
+        await registry.register("tenant-a", original)
+        await registry.register("tenant-a", original)
+
+        connection = store._require_connection()
+        cursor = await connection.execute(
+            "SELECT spec_json, spec_hash, COUNT(*) AS count FROM connectors WHERE tenant_id = ? AND connector_id = ? AND version = ?",
+            ("tenant-a", "connector-test", 1),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+
+        saved_spec = json.loads(row["spec_json"])
+        canonical_hash = hashlib.sha256(
+            json.dumps(original.spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+        assert row["count"] == 1
+        assert saved_spec["x-openapi-to-mcp-registration-hosts"] == ["93.184.216.34"]
+        assert row["spec_hash"] == canonical_hash
+
+        changed_payload = original.model_dump(mode="json")
+        changed_spec = changed_payload["spec"]
+        mutate(changed_spec, changed_payload)
+
+        with pytest.raises(ValueError, match="CONNECTOR_VERSION_IMMUTABLE"):
+            await registry.register("tenant-a", ConnectorDefinition.model_validate(changed_payload))
     finally:
         await store.close()
 

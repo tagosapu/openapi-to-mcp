@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Iterable
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -33,6 +34,7 @@ from .models import (
     TransferResult,
     TransferStatus,
 )
+from .openapi_contract import public_spec_hash
 
 
 ALLOWED_TRANSITIONS = {
@@ -317,20 +319,29 @@ class SqliteTransferStore:
     async def save_connector(self, connector: ConnectorDefinition, tenant_id: str) -> None:
         connection = self._require_connection()
         now = _utc_now()
-        payload = _json_dumps(connector.model_dump(mode="json"))
+        payload_object = connector.model_dump(mode="json")
+        cursor = await connection.execute(
+            """
+            SELECT config_json FROM connectors
+            WHERE tenant_id = ? AND connector_id = ? AND version = ?
+            LIMIT 1
+            """,
+            (tenant_id, connector.connector_id, connector.version),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        if existing is not None:
+            if _normalize_connector_payload(json.loads(existing["config_json"])) != _normalize_connector_payload(payload_object):
+                raise ValueError("CONNECTOR_VERSION_IMMUTABLE")
+            return
+        payload = _json_dumps(payload_object)
         spec_json = _json_dumps(connector.spec)
-        spec_hash = _sha256_hex(spec_json)
+        spec_hash = public_spec_hash(connector.spec)
         await connection.execute(
             """
             INSERT INTO connectors (
                 connector_id, tenant_id, version, config_json, spec_json, spec_hash, status, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (tenant_id, connector_id, version) DO UPDATE SET
-                config_json = excluded.config_json,
-                spec_json = excluded.spec_json,
-                spec_hash = excluded.spec_hash,
-                status = excluded.status,
-                updated_at = excluded.updated_at
             """,
             (
                 connector.connector_id,
@@ -1273,6 +1284,14 @@ def _json_dumps(value: Any) -> str:
 
 def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _normalize_connector_payload(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(value)
+    spec = normalized.get("spec")
+    if isinstance(spec, dict):
+        spec.pop("x-openapi-to-mcp-registration-hosts", None)
+    return normalized
 
 
 def _isoformat(value: datetime) -> str:

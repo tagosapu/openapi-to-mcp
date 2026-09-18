@@ -78,9 +78,7 @@ class ContractPreflight:
     def run(self, spec: dict[str, Any]) -> ContractPreflightResult:
         source = deepcopy(spec)
         issues: list[ContractIssue] = []
-        spec_hash = hashlib.sha256(
-            json.dumps(source, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
+        spec_hash = public_spec_hash(source)
         _collect_ref_issues(source, issues, path="#")
         try:
             validate(source)
@@ -129,6 +127,33 @@ class ContractPreflight:
                 request_schema = _request_schema(operation)
                 success_schema = _success_schema(operation)
                 error_statuses = _error_statuses(operation)
+                if success_schema is None:
+                    issues.append(
+                        ContractIssue(
+                            code="SUCCESS_RESPONSE_SCHEMA_MISSING",
+                            location=f"#/paths/{path_name}/{method_name}/responses",
+                            message="operation must define a success response schema",
+                            severity="error",
+                        )
+                    )
+                if not any(400 <= status <= 499 for status in error_statuses):
+                    issues.append(
+                        ContractIssue(
+                            code="ERROR_4XX_RESPONSE_MISSING",
+                            location=f"#/paths/{path_name}/{method_name}/responses",
+                            message="operation must define at least one representative 4xx response",
+                            severity="error",
+                        )
+                    )
+                if not any(500 <= status <= 599 for status in error_statuses):
+                    issues.append(
+                        ContractIssue(
+                            code="ERROR_5XX_RESPONSE_MISSING",
+                            location=f"#/paths/{path_name}/{method_name}/responses",
+                            message="operation must define at least one representative 5xx response",
+                            severity="error",
+                        )
+                    )
                 required_headers = [parameter.name for parameter in parameters if parameter.location == "header" and parameter.required]
                 operations[operation_id] = NormalizedOperation(
                     operation_id=operation_id,
@@ -151,6 +176,23 @@ class ContractPreflight:
         )
         result._resolved_spec = resolved_spec
         return result
+
+
+def canonicalize_public_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(spec)
+    normalized.pop("x-openapi-to-mcp-registration-hosts", None)
+    return normalized
+
+
+def public_spec_hash(spec: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            canonicalize_public_spec(spec),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _resolve_base_url(spec: dict[str, Any], issues: list[ContractIssue]) -> AnyHttpUrl | None:
@@ -231,6 +273,16 @@ def _normalize_security_options(
             )
         )
         return []
+    if not isinstance(security, list) or len(security) == 0:
+        issues.append(
+            ContractIssue(
+                code="OPERATION_SECURITY_EMPTY",
+                location=location,
+                message="operation-level security must declare at least one option",
+                severity="error",
+            )
+        )
+        return []
     options: list[SecurityOption] = []
     for entry in security:
         if not isinstance(entry, dict):
@@ -250,16 +302,21 @@ def _normalize_security_options(
             resolved[scheme_name] = list(scopes) if isinstance(scopes, list) else []
         if resolved:
             options.append(SecurityOption(schemes=resolved))
+    if not options:
+        issues.append(
+            ContractIssue(
+                code="OPERATION_SECURITY_EMPTY",
+                location=location,
+                message="operation-level security must resolve to at least one defined option",
+                severity="error",
+            )
+        )
     return options
 
 
 def _request_schema(operation: dict[str, Any]) -> dict[str, Any] | None:
     content = operation.get("requestBody", {}).get("content", {})
-    for media_type in ("application/json", "application/*+json"):
-        schema = content.get(media_type, {}).get("schema")
-        if isinstance(schema, dict):
-            return deepcopy(schema)
-    return None
+    return _json_content_schema(content)
 
 
 def _success_schema(operation: dict[str, Any]) -> dict[str, Any] | None:
@@ -267,7 +324,17 @@ def _success_schema(operation: dict[str, Any]) -> dict[str, Any] | None:
     for status in sorted(responses):
         if not str(status).startswith("2"):
             continue
-        schema = responses.get(status, {}).get("content", {}).get("application/json", {}).get("schema")
+        schema = _json_content_schema(responses.get(status, {}).get("content", {}))
+        if schema is not None:
+            return schema
+    return None
+
+
+def _json_content_schema(content: Any) -> dict[str, Any] | None:
+    if not isinstance(content, dict):
+        return None
+    for media_type in ("application/json", "application/*+json"):
+        schema = content.get(media_type, {}).get("schema")
         if isinstance(schema, dict):
             return deepcopy(schema)
     return None

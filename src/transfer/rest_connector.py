@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import ipaddress
 import json
+import re
 import socket
 import time
 from typing import Any
@@ -19,7 +21,7 @@ from .connector import ErrorClassification, OutboundOutcome, OutboundRequest, Re
 from .errors import MappingValidationError, NotFoundError
 from .mapping import MappingEngine
 from .models import ConnectorDefinition, MappingDefinition, MappingIssue, OperationBinding, OperationSelection, OutboundRequestParts, TransferRequest, TransferResult
-from .openapi_contract import ContractPreflight, ContractPreflightResult, NormalizedOperation
+from .openapi_contract import ContractPreflight, ContractPreflightResult, NormalizedOperation, ParameterDefinition
 from .settings import TransferSettings as Settings
 
 
@@ -138,7 +140,7 @@ class RestOpenApiConnector:
             if key not in headers:
                 raise ValueError(f"REQUIRED_HEADER_MISSING:{key}")
         path = _render_path(operation.path, parts.path_params)
-        url = httpx.URL(str(self._definition.base_url)).join(path)
+        url = _join_base_url_path(self._definition.base_url, path)
         query = dict(parts.query_params)
         query.update(auth_query)
         if query:
@@ -161,14 +163,30 @@ class RestOpenApiConnector:
 
         start = time.perf_counter()
         try:
-            response = await self._send_http(request)
-            outcome = self._build_outcome(response, elapsed_ms=_elapsed_ms(start))
-            if response.status_code in {301, 302, 303, 307, 308}:
-                outcome.headers[INTERNAL_ERROR_CODE_HEADER] = "HTTP_REDIRECT_BLOCKED"
-            elif response.content and len(response.content) > self._definition.policy.max_response_bytes:
-                outcome.headers[INTERNAL_ERROR_CODE_HEADER] = "RESPONSE_TOO_LARGE"
-                outcome.body = None
-            return outcome
+            async with asyncio.timeout(self._definition.policy.total_timeout_seconds):
+                response, response_stream = await self._send_http(request)
+                try:
+                    body_bytes, read_error = await self._read_response_bytes(response)
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        outcome = self._build_outcome(response, body_bytes=body_bytes, elapsed_ms=_elapsed_ms(start))
+                        outcome.headers[INTERNAL_ERROR_CODE_HEADER] = "HTTP_REDIRECT_BLOCKED"
+                        return outcome
+                    if read_error is not None:
+                        outcome = OutboundOutcome(
+                            delivery_state="received",
+                            status_code=response.status_code,
+                            headers={key: value for key, value in response.headers.items()},
+                            body=None,
+                            request_id=response.headers.get("X-Request-Id") or response.headers.get("x-request-id"),
+                            elapsed_ms=_elapsed_ms(start),
+                        )
+                        outcome.headers[INTERNAL_ERROR_CODE_HEADER] = read_error
+                        return outcome
+                    return self._build_outcome(response, body_bytes=body_bytes, elapsed_ms=_elapsed_ms(start))
+                finally:
+                    await response_stream.__aexit__(None, None, None)
+        except TimeoutError:
+            return self._internal_outcome("unknown", "DELIVERY_UNKNOWN", start)
         except httpx.ConnectTimeout:
             return self._internal_outcome("not_sent", "CONNECTION_TIMEOUT", start)
         except httpx.ConnectError:
@@ -234,10 +252,21 @@ class RestOpenApiConnector:
         lookup_operation = self._preflight.operations.get(lookup_operation_id)
         if lookup_operation is None:
             return ReconciliationResult(state="unknown")
-        parameter_value = context.target_resource_id or str(_decode_canonical_scalar(context.deduplication_value))
         lookup_name = binding.lookup_parameter_name
         lookup_location = binding.lookup_parameter_location
         if lookup_name is None or lookup_location is None:
+            return ReconciliationResult(state="unknown")
+        lookup_parameter = _lookup_parameter(lookup_operation, lookup_name, lookup_location)
+        if lookup_parameter is None:
+            return ReconciliationResult(state="unknown")
+        raw_lookup_value: Any
+        if context.target_resource_id is not None:
+            raw_lookup_value = context.target_resource_id
+        else:
+            raw_lookup_value = _decode_canonical_scalar(context.deduplication_value)
+        try:
+            parameter_value = _coerce_lookup_parameter_value(raw_lookup_value, lookup_parameter)
+        except ValueError:
             return ReconciliationResult(state="unknown")
         parts = OutboundRequestParts(
             operation_id=lookup_operation_id,
@@ -263,41 +292,59 @@ class RestOpenApiConnector:
             return ReconciliationResult(state="registered", target_resource_id=resource_id)
         return ReconciliationResult(state="unknown")
 
-    async def _send_http(self, request: OutboundRequest) -> httpx.Response:
-        response = await self._http_client.request(
-            request.method,
-            str(request.url),
-            headers=request.headers,
-            json=request.json_body,
-            timeout=httpx.Timeout(
-                connect=self._definition.policy.connect_timeout_seconds,
-                read=self._definition.policy.read_timeout_seconds,
-                write=self._definition.policy.read_timeout_seconds,
-                pool=self._definition.policy.total_timeout_seconds,
-            ),
-            follow_redirects=False,
-        )
+    async def _send_http(self, request: OutboundRequest) -> tuple[httpx.Response, Any]:
+        response, response_stream = await self._dispatch_request(request.method, request.url, request.headers, request.json_body)
         if response.status_code == 401 and self._last_operation_id is not None and _token_expired(response.headers):
             operation = self._operation_by_id(self._last_operation_id)
             if self._invalidate_oauth_token(operation):
+                await response_stream.__aexit__(None, None, None)
                 auth_headers, auth_query = await self._build_auth(operation)
                 retry_headers = dict(request.headers)
                 retry_headers.update(auth_headers)
                 retry_url = request.url.copy_merge_params(auth_query) if auth_query else request.url
-                return await self._http_client.request(
-                    request.method,
-                    str(retry_url),
-                    headers=retry_headers,
-                    json=request.json_body,
-                    timeout=httpx.Timeout(
-                        connect=self._definition.policy.connect_timeout_seconds,
-                        read=self._definition.policy.read_timeout_seconds,
-                        write=self._definition.policy.read_timeout_seconds,
-                        pool=self._definition.policy.total_timeout_seconds,
-                    ),
-                    follow_redirects=False,
-                )
-        return response
+                return await self._dispatch_request(request.method, retry_url, retry_headers, request.json_body)
+        return response, response_stream
+
+    async def _dispatch_request(
+        self,
+        method: str,
+        url: httpx.URL,
+        headers: dict[str, str],
+        json_body: dict[str, Any] | list[Any] | None,
+    ) -> tuple[httpx.Response, Any]:
+        response_stream = self._http_client.stream(
+            method,
+            str(url),
+            headers=headers,
+            json=json_body,
+            timeout=httpx.Timeout(
+                connect=self._definition.policy.connect_timeout_seconds,
+                read=self._definition.policy.read_timeout_seconds,
+                write=self._definition.policy.read_timeout_seconds,
+                pool=self._definition.policy.connect_timeout_seconds,
+            ),
+            follow_redirects=False,
+        )
+        response = await response_stream.__aenter__()
+        return response, response_stream
+
+    async def _read_response_bytes(self, response: httpx.Response) -> tuple[bytes, str | None]:
+        max_bytes = self._definition.policy.max_response_bytes
+        content_length = response.headers.get("content-length") or response.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                if int(content_length) > max_bytes:
+                    return b"", "RESPONSE_TOO_LARGE"
+            except ValueError:
+                pass
+        chunks: list[bytes] = []
+        total_bytes = 0
+        async for chunk in response.aiter_bytes():
+            total_bytes += len(chunk)
+            if total_bytes > max_bytes:
+                return b"", "RESPONSE_TOO_LARGE"
+            chunks.append(chunk)
+        return b"".join(chunks), None
 
     async def _build_auth(self, operation: NormalizedOperation) -> tuple[dict[str, str], dict[str, str]]:
         if not operation.security_options:
@@ -414,28 +461,54 @@ class RestOpenApiConnector:
                 raise ValueError("SSRF_ADDRESS_BLOCKED")
             raise ValueError("SSRF_DNS_REBINDING_DETECTED")
 
-    def _build_outcome(self, response: httpx.Response, *, elapsed_ms: int = 0) -> OutboundOutcome:
+    def _build_outcome(self, response: httpx.Response, *, body_bytes: bytes, elapsed_ms: int = 0) -> OutboundOutcome:
         body: dict[str, Any] | list[Any] | None = None
+        parse_error = False
         content_type = response.headers.get("content-type", "")
-        if response.content and "json" in content_type:
+        if body_bytes and "json" in content_type:
             try:
-                parsed = response.json()
+                parsed = json.loads(body_bytes)
                 if isinstance(parsed, (dict, list)):
                     body = parsed
+                else:
+                    parse_error = True
             except ValueError:
-                body = None
-        elif response.content:
+                parse_error = True
+        elif body_bytes:
             try:
-                parsed = json.loads(response.content.decode("utf-8"))
+                parsed = json.loads(body_bytes.decode("utf-8"))
                 if isinstance(parsed, (dict, list)):
                     body = parsed
+                else:
+                    parse_error = True
             except (UnicodeDecodeError, json.JSONDecodeError):
-                body = None
+                parse_error = True
+        operation = self._operation_by_id(self._last_operation_id) if self._last_operation_id is not None else None
+        if _requires_success_body_validation(response.status_code, operation):
+            if parse_error or body is None:
+                return self._response_format_unknown(response, elapsed_ms)
+            if operation is not None and operation.success_schema is not None:
+                validator = Draft202012Validator(operation.success_schema)
+                if not validator.is_valid(body):
+                    return self._response_format_unknown(response, elapsed_ms)
         return OutboundOutcome(
             delivery_state="received",
             status_code=response.status_code,
             headers={key: value for key, value in response.headers.items()},
             body=body,
+            request_id=response.headers.get("X-Request-Id") or response.headers.get("x-request-id"),
+            elapsed_ms=elapsed_ms,
+        )
+
+    def _response_format_unknown(self, response: httpx.Response, elapsed_ms: int) -> OutboundOutcome:
+        return OutboundOutcome(
+            delivery_state="unknown",
+            status_code=response.status_code,
+            headers={
+                **{key: value for key, value in response.headers.items()},
+                INTERNAL_ERROR_CODE_HEADER: "RESPONSE_FORMAT_UNKNOWN",
+            },
+            body=None,
             request_id=response.headers.get("X-Request-Id") or response.headers.get("x-request-id"),
             elapsed_ms=elapsed_ms,
         )
@@ -627,3 +700,97 @@ def _is_blocked_ip(address: str) -> bool:
         or ip.is_reserved
         or ip.is_unspecified
     )
+
+
+def _join_base_url_path(base_url: Any, path: str) -> httpx.URL:
+    url = httpx.URL(str(base_url))
+    base_path = url.path.rstrip("/")
+    if base_path == "/":
+        base_path = ""
+    rendered_path = path if path.startswith("/") else f"/{path}"
+    return url.copy_with(path=f"{base_path}{rendered_path}")
+
+
+def _requires_success_body_validation(
+    status_code: int,
+    operation: NormalizedOperation | None,
+) -> bool:
+    return operation is not None and operation.success_schema is not None and 200 <= status_code <= 299
+
+
+def _lookup_parameter(
+    operation: NormalizedOperation,
+    name: str,
+    location: str,
+) -> ParameterDefinition | None:
+    for parameter in operation.parameters:
+        if parameter.name == name and parameter.location == location:
+            return parameter
+    return None
+
+
+def _coerce_lookup_parameter_value(value: Any, parameter: ParameterDefinition) -> str:
+    schema = parameter.schema
+    schema_type = schema.get("type")
+    if schema_type in {"array", "object"} or isinstance(value, (dict, list)) or value is None:
+        raise ValueError("LOOKUP_PARAMETER_INVALID")
+    if schema_type == "string" or schema_type is None:
+        coerced: Any = value if isinstance(value, str) else _encode_scalar(value)
+    elif schema_type == "integer":
+        coerced = _coerce_integer(value)
+    elif schema_type == "number":
+        coerced = _coerce_number(value)
+    elif schema_type == "boolean":
+        coerced = _coerce_boolean(value)
+    else:
+        raise ValueError("LOOKUP_PARAMETER_UNSUPPORTED")
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and coerced not in enum_values:
+        raise ValueError("LOOKUP_PARAMETER_INVALID")
+    return _encode_scalar(coerced)
+
+
+def _coerce_integer(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("LOOKUP_PARAMETER_INVALID")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value):
+        return int(value)
+    raise ValueError("LOOKUP_PARAMETER_INVALID")
+
+
+def _coerce_number(value: Any) -> int | float:
+    if isinstance(value, bool):
+        raise ValueError("LOOKUP_PARAMETER_INVALID")
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise ValueError("LOOKUP_PARAMETER_INVALID") from exc
+        return int(number) if number.is_integer() else number
+    raise ValueError("LOOKUP_PARAMETER_INVALID")
+
+
+def _coerce_boolean(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    raise ValueError("LOOKUP_PARAMETER_INVALID")
+
+
+def _encode_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return json.dumps(value, separators=(",", ":"))
+    return str(value)
