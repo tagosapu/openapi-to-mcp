@@ -1,0 +1,69 @@
+{
+  "schema_version": "ocr-transfer/v1",
+  "document": {
+    "document_id": "vendor-b-doc-0007",
+    "document_type": "invoice",
+    "source_system": "ocr-service-b",
+    "occurred_at": "2026-09-18T04:05:00Z",
+    "content": {
+      "media_type": "application/pdf",
+      "filename": "vendor-b-invoice-0007.pdf",
+      "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "storage_ref": "object://documents/vendor-b-doc-0007"
+    }
+  },
+  "ocr": {
+    "languages": ["en", "ja"],
+    "text_ref": "object://ocr-text/vendor-b-doc-0007",
+    "fields": {
+      "invoice_number": {
+        "raw_value": "VB-0007",
+        "value": "VB-0007",
+        "value_type": "string",
+        "confidence": 0.97,
+        "status": "extracted"
+      },
+      "total_amount": {
+        "raw_value": "8450.50",
+        "value": 8450.5,
+        "value_type": "currency",
+        "unit": "JPY",
+        "confidence": 0.93,
+        "status": "extracted"
+      }
+    },
+    "line_items": [
+      {
+        "fields": {
+          "description": {
+            "raw_value": "Office supplies",
+            "value": "Office supplies",
+            "value_type": "string",
+            "confidence": 0.9,
+            "status": "extracted"
+          },
+          "quantity": {
+            "raw_value": "3",
+            "value": 3,
+            "value_type": "integer",
+            "confidence": 0.98,
+            "status": "extracted"
+          }
+        }
+      }
+    ]
+  },
+  "delivery": {
+    "connector_id": "invoice-target-alt",
+    "mapping_id": "invoice-v1",
+    "operation": "upsert",
+    "deduplication_key_path": "/ocr/fields/invoice_number/value"
+  },
+  "metadata": {
+    "tenant_id": "tenant-a",
+    "correlation_id": "corr-vendor-b-0007",
+    "labels": {
+      "department": "procurement"
+    }
+  }
+}

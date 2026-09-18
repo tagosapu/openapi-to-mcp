@@ -1,0 +1,52 @@
+{
+  "mapping_id": "invoice-v1",
+  "version": 1,
+  "status": "published",
+  "connector_id": "invoice-target",
+  "document_types": ["invoice"],
+  "operations": ["create", "update", "upsert"],
+  "deduplication_key_path": "/ocr/fields/invoice_number/value",
+  "target_schema_ref": "openapi:#/components/schemas/InvoiceUpsertRequest",
+  "rules": [
+    {
+      "rule_id": "external-id-body",
+      "source": "/ocr/fields/invoice_number/value",
+      "target": {"location": "body", "pointer": "/external_id"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    },
+    {
+      "rule_id": "external-id-path",
+      "source": "/ocr/fields/invoice_number/value",
+      "target": {"location": "path", "name": "external_id"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    },
+    {
+      "rule_id": "invoice-number",
+      "source": "/ocr/fields/invoice_number/value",
+      "target": {"location": "body", "pointer": "/invoice_number"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    },
+    {
+      "rule_id": "total-amount",
+      "source": "/ocr/fields/total_amount/value",
+      "target": {"location": "body", "pointer": "/total_amount"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    },
+    {
+      "rule_id": "source-document",
+      "source": "/document/document_id",
+      "target": {"location": "body", "pointer": "/source_document_id"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    }
+  ]
+}

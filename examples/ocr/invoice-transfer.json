@@ -1,0 +1,69 @@
+{
+  "schema_version": "ocr-transfer/v1",
+  "document": {
+    "document_id": "doc-invoice-0001",
+    "document_type": "invoice",
+    "source_system": "ocr-service-a",
+    "occurred_at": "2026-09-18T04:00:00Z",
+    "content": {
+      "media_type": "application/pdf",
+      "filename": "invoice-0001.pdf",
+      "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "storage_ref": "object://documents/doc-invoice-0001"
+    }
+  },
+  "ocr": {
+    "languages": ["en"],
+    "text_ref": "object://ocr-text/doc-invoice-0001",
+    "fields": {
+      "invoice_number": {
+        "raw_value": "INV-0001",
+        "value": "INV-0001",
+        "value_type": "string",
+        "confidence": 0.98,
+        "status": "extracted"
+      },
+      "total_amount": {
+        "raw_value": "12000.00",
+        "value": 12000,
+        "value_type": "currency",
+        "unit": "JPY",
+        "confidence": 0.95,
+        "status": "extracted"
+      }
+    },
+    "line_items": [
+      {
+        "fields": {
+          "description": {
+            "raw_value": "Service subscription",
+            "value": "Service subscription",
+            "value_type": "string",
+            "confidence": 0.91,
+            "status": "extracted"
+          },
+          "quantity": {
+            "raw_value": "1",
+            "value": 1,
+            "value_type": "integer",
+            "confidence": 0.99,
+            "status": "extracted"
+          }
+        }
+      }
+    ]
+  },
+  "delivery": {
+    "connector_id": "invoice-target",
+    "mapping_id": "invoice-v1",
+    "operation": "upsert",
+    "deduplication_key_path": "/ocr/fields/invoice_number/value"
+  },
+  "metadata": {
+    "tenant_id": "tenant-a",
+    "correlation_id": "corr-invoice-0001",
+    "labels": {
+      "department": "accounting"
+    }
+  }
+}

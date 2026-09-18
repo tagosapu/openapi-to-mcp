@@ -1,0 +1,260 @@
+openapi: 3.1.0
+info:
+  title: Invoice Target API
+  version: 1.0.0
+  description: In-process invoice API used by OCR transfer integration tests.
+servers:
+  - url: http://target.test
+paths:
+  /target/invoices:
+    post:
+      operationId: createInvoice
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoiceUpsertRequest'
+      responses:
+        '201':
+          description: Invoice created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '400':
+          description: Target validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: external_id is already registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          description: Target rate limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Target failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    get:
+      operationId: findInvoices
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - name: external_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Matching invoices.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceListResponse'
+        '400':
+          description: Invalid lookup.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Target failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /target/invoices/{external_id}:
+    parameters:
+      - name: external_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getInvoice
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+      responses:
+        '200':
+          description: Invoice found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '404':
+          description: Invoice not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Target failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    put:
+      operationId: replaceInvoice
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoiceUpsertRequest'
+      responses:
+        '200':
+          description: Invoice updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '201':
+          description: Invoice inserted by upsert.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '400':
+          description: Target validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Invoice not found for update.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          description: Target rate limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Target failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+x-openapi-to-mcp-operation-bindings:
+  create:
+    operation_id: createInvoice
+    idempotency_header: Idempotency-Key
+    lookup_operation_id: getInvoice
+    lookup_parameter_name: external_id
+    lookup_parameter_location: path
+    postcondition:
+      reconcile_operation_id: getInvoice
+      result_id_pointer: /id
+      not_found_statuses: [404]
+      registered_statuses: [200, 201]
+  update:
+    operation_id: replaceInvoice
+    idempotency_header: Idempotency-Key
+    lookup_operation_id: getInvoice
+    lookup_parameter_name: external_id
+    lookup_parameter_location: path
+    postcondition:
+      reconcile_operation_id: getInvoice
+      result_id_pointer: /id
+      not_found_statuses: [404]
+      registered_statuses: [200, 201]
+  upsert:
+    operation_id: replaceInvoice
+    idempotency_header: Idempotency-Key
+    lookup_operation_id: getInvoice
+    lookup_parameter_name: external_id
+    lookup_parameter_location: path
+    postcondition:
+      reconcile_operation_id: getInvoice
+      result_id_pointer: /id
+      not_found_statuses: [404]
+      registered_statuses: [200, 201]
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+  parameters:
+    ApiVersion:
+      name: X-Api-Version
+      in: header
+      required: true
+      schema:
+        type: string
+  schemas:
+    InvoiceUpsertRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        external_id:
+          type: string
+          minLength: 1
+        invoice_number:
+          type: string
+          minLength: 1
+        total_amount:
+          type: number
+        source_document_id:
+          type: string
+          minLength: 1
+      required: [external_id, invoice_number, total_amount, source_document_id]
+    InvoiceResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+          minLength: 1
+        external_id:
+          type: string
+          minLength: 1
+        invoice_number:
+          type: string
+        total_amount:
+          type: number
+        source_document_id:
+          type: string
+      required: [id, external_id]
+    InvoiceListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvoiceResponse'
+      required: [items]
+    Problem:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+      required: [code]

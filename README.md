@@ -25,6 +25,7 @@
   - [Basic Usage](#basic-usage)
   - [Command Line Options](#command-line-options)
   - [Environment Variables](#environment-variables)
+- [OCR Transfer API](#ocr-transfer-api)
 - [Examples](#examples)
 - [Configuration](#configuration)
 - [Output Structure](#output-structure)
@@ -244,6 +245,43 @@ AZURE_OPENAI_API_VERSION=2024-10-21
 ```
 
 `VISION_MODEL` must match the deployment name configured in Azure OpenAI. The alternative `MODEL=azure/your-deployment-name` format is also supported.
+
+## OCR Transfer API
+
+The OCR transfer service accepts the canonical `ocr-transfer/v1` JSON contract and delivers one document at a time through a registered REST/OpenAPI connector. Copy `env.example` to `.env`, configure the `TRANSFER_*` settings, and start the service with:
+
+```bash
+uv run ocr-transfer-api --host 127.0.0.1 --port 8080
+```
+
+Register a connector with `POST /v1/connectors` using an inline OpenAPI snapshot. The snapshot must include the operation bindings extension for `create`, `update`, and `upsert`. Set `credential_ref` to a resolver reference, and declare the required `X-Api-Version` header with a non-secret `value_ref`. Register the published mapping with `POST /v1/mappings`; its `connector_id`, supported operations, deduplication path, and `target_schema_ref` must match the connector contract. Credential values stay in the configured resolver and never belong in the OpenAPI, mapping, or OCR JSON.
+
+Submit a secret-free standard OCR document after registration:
+
+```bash
+curl \
+  -H "Authorization: Bearer ${TRANSFER_TEST_TOKEN}" \
+  -H "Idempotency-Key: invoice-0001" \
+  -H "Content-Type: application/json" \
+  -d @examples/ocr/invoice-transfer.json \
+  http://127.0.0.1:8080/v1/transfers
+```
+
+Use the returned `transfer_id` with `GET /v1/transfers/{transfer_id}`. A delivery with an unknown outcome is held in `reconciliation_required`; it is not automatically resent. An operator can confirm a resource, confirm it is absent so the queued transfer may be resent, or leave it unresolved with `POST /v1/transfers/{transfer_id}/reconcile`:
+
+```bash
+curl \
+  -H "Authorization: Bearer ${TRANSFER_TEST_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"resolution":"confirmed_absent","notes":"verified in the target API"}' \
+  http://127.0.0.1:8080/v1/transfers/TRANSFER_ID/reconcile
+```
+
+The repository includes two standard OCR inputs at [examples/ocr/invoice-transfer.json](examples/ocr/invoice-transfer.json) and [examples/ocr/invoice-transfer-alt.json](examples/ocr/invoice-transfer-alt.json). Run the complete test suite with:
+
+```bash
+uv run pytest -q
+```
 
 ## Examples
 
