@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
@@ -15,6 +16,7 @@ from src.transfer.connector import (
     ReconciliationResult,
     ValidationResult,
 )
+from src.transfer.errors import MappingValidationError
 from src.transfer.mapping import MappingEngine
 from src.transfer.models import (
     ConnectorDefinition,
@@ -555,6 +557,56 @@ async def test_worker_retries_not_sent_retryable_errors_with_retry_after_and_red
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "classification_code", "retry_after_seconds", "expected_delay_seconds"),
+    [
+        (429, "HTTP_429", 7, 7),
+        (503, "HTTP_5XX", None, 1),
+    ],
+)
+async def test_worker_retries_retryable_received_http_statuses(
+    store,
+    monkeypatch,
+    status_code: int,
+    classification_code: str,
+    retry_after_seconds: int | None,
+    expected_delay_seconds: int,
+) -> None:
+    await _save_prereqs(store)
+    headers = {"Retry-After": str(retry_after_seconds)} if retry_after_seconds is not None else {}
+    connector = FakeConnector(
+        outcome=OutboundOutcome(
+            delivery_state="received",
+            status_code=status_code,
+            headers=headers,
+            body={"error": "retry later"},
+            request_id=f"req-{status_code}",
+            elapsed_ms=14,
+        ),
+        classification=ErrorClassification(
+            code=classification_code,
+            retryable=True,
+            delivery_state="received",
+            retry_after_seconds=retry_after_seconds,
+        ),
+    )
+    registry = FakeRegistry({("tenant-a", "connector-test", 7): connector})
+    worker = TransferWorker(store, registry, MappingEngine(), RetryPolicy(jitter_ratio=0.0))
+    transfer_id = await seed_queued_transfer(store, suffix=f"received-{status_code}")
+    monkeypatch.setattr("src.transfer.worker._utc_now", lambda: FIXED_NOW)
+
+    await worker.run_once()
+
+    record = await store.get_transfer("tenant-a", transfer_id)
+    assert record is not None
+    assert record.status == TransferStatus.RETRYING
+    assert record.next_retry_at == FIXED_NOW + timedelta(seconds=expected_delay_seconds)
+    assert record.error is not None
+    assert record.error.code == classification_code
+    assert record.error.retryable is True
+
+
+@pytest.mark.asyncio
 async def test_worker_stops_retrying_at_max_attempts(store, monkeypatch) -> None:
     await _save_prereqs(store)
     connector = FakeConnector(
@@ -621,6 +673,63 @@ async def test_worker_marks_send_timeout_as_reconciliation_required(store, monke
     record = await store.get_transfer("tenant-a", transfer_id)
     assert record is not None
     assert record.status == TransferStatus.RECONCILIATION_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_worker_routes_pre_send_mapping_validation_failure_to_waiting_review(
+    store, monkeypatch
+) -> None:
+    class ApplyFailsMappingEngine(MappingEngine):
+        def apply(self, payload, mapping, operation):
+            raise MappingValidationError("mapping requires review before apply")
+
+    await _save_prereqs(store)
+    connector = FakeConnector()
+    registry = FakeRegistry({("tenant-a", "connector-test", 7): connector})
+    worker = TransferWorker(store, registry, ApplyFailsMappingEngine(), RetryPolicy(jitter_ratio=0.0))
+    transfer_id = await seed_queued_transfer(store, suffix="apply-review")
+    monkeypatch.setattr("src.transfer.worker._utc_now", lambda: FIXED_NOW)
+
+    await worker.run_once()
+
+    record = await store.get_transfer("tenant-a", transfer_id)
+    assert record is not None
+    assert record.status == TransferStatus.WAITING_REVIEW
+    assert record.error is not None
+    assert record.error.retryable is False
+    assert connector.send_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "build_error",
+    [
+        ValueError("REQUIRED_HEADER_MISSING:X-Api-Version"),
+        RuntimeError("credential ref not found: secret://missing"),
+    ],
+)
+async def test_worker_marks_pre_send_config_and_auth_failures_failed_without_http_send(
+    store, monkeypatch, build_error: Exception
+) -> None:
+    async def raise_during_build(parts: OutboundRequestParts) -> None:
+        raise build_error
+
+    await _save_prereqs(store)
+    connector = FakeConnector(on_build_request=raise_during_build)
+    registry = FakeRegistry({("tenant-a", "connector-test", 7): connector})
+    worker = TransferWorker(store, registry, MappingEngine(), RetryPolicy(jitter_ratio=0.0))
+    transfer_id = await seed_queued_transfer(store, suffix=f"pre-send-{type(build_error).__name__}")
+    monkeypatch.setattr("src.transfer.worker._utc_now", lambda: FIXED_NOW)
+
+    await worker.run_once()
+
+    record = await store.get_transfer("tenant-a", transfer_id)
+    assert record is not None
+    assert record.status == TransferStatus.FAILED
+    assert record.error is not None
+    assert record.error.retryable is False
+    assert record.error.code not in {"DELIVERY_UNKNOWN", "UNEXPECTED_ERROR"}
+    assert connector.send_calls == 0
 
 
 @pytest.mark.asyncio
@@ -694,6 +803,59 @@ async def test_worker_recovers_inflight_states_on_restart(store) -> None:
 
 
 @pytest.mark.asyncio
+async def test_worker_start_persists_job_failure_and_continues_to_next_job(store, monkeypatch) -> None:
+    await _save_prereqs(
+        store,
+        connectors=[_connector_definition(version=7), _connector_definition(version=8)],
+    )
+    failing_connector = FakeConnector(parse_error=ValueError("RESPONSE_ID_INVALID"))
+    succeeding_connector = FakeConnector(
+        outcome=OutboundOutcome(
+            delivery_state="received",
+            status_code=201,
+            headers={},
+            body={"id": "target-loop-success"},
+            request_id="req-loop-success",
+            elapsed_ms=10,
+        ),
+        reconcile_result=ReconciliationResult(
+            state="registered",
+            target_resource_id="target-loop-success",
+        ),
+    )
+    registry = FakeRegistry(
+        {
+            ("tenant-a", "connector-test", 7): failing_connector,
+            ("tenant-a", "connector-test", 8): succeeding_connector,
+        }
+    )
+    worker = TransferWorker(store, registry, MappingEngine(), RetryPolicy(jitter_ratio=0.0))
+    first_transfer_id = await _seed_transfer(store, suffix="loop-fail", status=TransferStatus.QUEUED, connector_version=7)
+    second_transfer_id = await _seed_transfer(store, suffix="loop-success", status=TransferStatus.QUEUED, connector_version=8)
+    monkeypatch.setattr("src.transfer.worker._utc_now", lambda: FIXED_NOW)
+
+    await worker.start()
+    try:
+        async def wait_for_processing() -> tuple[Any, Any]:
+            while True:
+                first = await store.get_transfer("tenant-a", first_transfer_id)
+                second = await store.get_transfer("tenant-a", second_transfer_id)
+                if first is not None and second is not None:
+                    if first.status == TransferStatus.FAILED and second.status == TransferStatus.SUCCEEDED:
+                        return first, second
+                await asyncio.sleep(0)
+
+        first_record, second_record = await asyncio.wait_for(wait_for_processing(), timeout=1)
+    finally:
+        await worker.stop()
+
+    assert first_record.error is not None
+    assert first_record.error.code == "RESPONSE_ID_INVALID"
+    assert second_record.result is not None
+    assert second_record.result.target_resource_id == "target-loop-success"
+
+
+@pytest.mark.asyncio
 async def test_worker_review_approve_revalidates_latest_correction(store, monkeypatch) -> None:
     await _save_prereqs(store)
     connector = FakeConnector()
@@ -719,6 +881,52 @@ async def test_worker_review_approve_revalidates_latest_correction(store, monkey
 
 
 @pytest.mark.asyncio
+async def test_worker_retry_transfer_clears_stale_result_error_and_completed_at(store) -> None:
+    await _save_prereqs(store)
+    worker = TransferWorker(
+        store,
+        FakeRegistry({("tenant-a", "connector-test", 7): FakeConnector()}),
+        MappingEngine(),
+        RetryPolicy(jitter_ratio=0.0),
+    )
+    transfer_id = await seed_queued_transfer(store, suffix="manual-retry")
+    claimed = await store.claim_due_transfer(FIXED_NOW)
+
+    assert claimed is not None
+
+    await store.transition_state(
+        "tenant-a",
+        transfer_id,
+        TransferStatus.DELIVERING,
+        TransferStatus.FAILED,
+        {"reason": "initial failure"},
+        result=TransferResult(
+            target_resource_id="stale-target",
+            target_request_id="stale-request",
+            postcondition_verified=False,
+            completed_at=FIXED_NOW,
+            response_ref=None,
+        ),
+        error={
+            "type": "https://openapi-to-mcp/errors/http_503",
+            "title": "initial failure",
+            "status": 503,
+            "code": "HTTP_503",
+            "detail": "downstream unavailable",
+            "correlation_id": "corr-manual-retry",
+            "retryable": False,
+        },
+    )
+
+    record = await worker.retry_transfer("tenant-a", transfer_id)
+
+    assert record.status == TransferStatus.QUEUED
+    assert record.result is None
+    assert record.error is None
+    assert record.completed_at is None
+
+
+@pytest.mark.asyncio
 async def test_worker_review_correct_saves_encrypted_correction_and_redacts_events(
     encrypted_store, monkeypatch
 ) -> None:
@@ -728,7 +936,43 @@ async def test_worker_review_correct_saves_encrypted_correction_and_redacts_even
     registry = FakeRegistry({("tenant-a", "connector-test", 7): connector})
     worker = TransferWorker(store, registry, MappingEngine(), RetryPolicy(jitter_ratio=0.0))
     transfer_id = await _seed_transfer(store, suffix="correct", status=TransferStatus.WAITING_REVIEW)
+    connection = store._require_connection()
+    await connection.execute(
+        """
+        UPDATE transfers
+        SET result_json = ?, error_json = ?, completed_at = ?
+        WHERE tenant_id = ? AND transfer_id = ?
+        """,
+        (
+            json.dumps(
+                {
+                    "target_resource_id": "stale-target",
+                    "target_request_id": "stale-request",
+                    "postcondition_verified": False,
+                    "completed_at": FIXED_NOW.isoformat().replace("+00:00", "Z"),
+                    "response_ref": None,
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "https://openapi-to-mcp/errors/stale",
+                    "title": "stale error",
+                    "status": 422,
+                    "code": "STALE_ERROR",
+                    "detail": "stale detail",
+                    "correlation_id": "corr-correct",
+                    "retryable": False,
+                    "errors": [],
+                }
+            ),
+            FIXED_NOW.isoformat().replace("+00:00", "Z"),
+            "tenant-a",
+            transfer_id,
+        ),
+    )
+    await connection.commit()
     monkeypatch.setattr("src.transfer.worker._utc_now", lambda: FIXED_NOW)
+    actor = "reviewer-42"
 
     record = await worker.review_transfer(
         "tenant-a",
@@ -739,12 +983,17 @@ async def test_worker_review_correct_saves_encrypted_correction_and_redacts_even
             "/ocr/fields/invoice_number/status": "manually_corrected",
         },
         "fix OCR",
+        actor=actor,
     )
     latest_correction = await store.get_latest_review_correction("tenant-a", transfer_id)
 
     assert record.status == TransferStatus.QUEUED
+    assert record.result is None
+    assert record.error is None
+    assert record.completed_at is None
     assert latest_correction is not None
     assert latest_correction.values["/ocr/fields/invoice_number/value"] == "INV-REVIEWED"
+    assert latest_correction.actor == actor
 
     connection = sqlite3.connect(db_path)
     try:
@@ -766,7 +1015,7 @@ async def test_worker_review_correct_saves_encrypted_correction_and_redacts_even
     assert all("INV-REVIEWED" not in detail for detail in stored_event_details)
     assert any(
         json.loads(detail) == {
-            "actor": "system",
+            "actor": actor,
             "reason": "fix OCR",
             "correction_ref": latest_correction.correction_ref,
         }

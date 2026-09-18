@@ -107,6 +107,9 @@ class TransferWorker:
                 TransferStatus.FAILED,
                 TransferStatus.QUEUED,
                 {"reason": "manual retry"},
+                clear_result=True,
+                clear_error=True,
+                clear_completed_at=True,
             )
         if record.status == TransferStatus.RECONCILIATION_REQUIRED:
             return await self._store.transition_state(
@@ -115,6 +118,9 @@ class TransferWorker:
                 TransferStatus.RECONCILIATION_REQUIRED,
                 TransferStatus.QUEUED,
                 {"reason": "manual retry"},
+                clear_result=True,
+                clear_error=True,
+                clear_completed_at=True,
             )
         raise InvalidTransitionError(f"cannot retry transfer from {record.status.value}")
 
@@ -132,6 +138,8 @@ class TransferWorker:
         decision: Literal["approve", "correct", "reject"],
         correction: dict[str, Any] | None,
         reason: str | None,
+        *,
+        actor: str = _REVIEW_ACTOR,
     ) -> TransferRecord:
         record = await self._require_record(tenant_id, transfer_id)
         if record.status != TransferStatus.WAITING_REVIEW:
@@ -145,6 +153,7 @@ class TransferWorker:
                 TransferStatus.FAILED,
                 {
                     "actor": _REVIEW_ACTOR,
+                    "actor": actor,
                     "decision": decision,
                     "reason": reason,
                 },
@@ -162,7 +171,7 @@ class TransferWorker:
                 raise MappingValidationError("correction values are required")
             effective_payload = self._mapping_engine.apply_corrections(
                 record.request,
-                _review_correction_model(correction, reason),
+                _review_correction_model(correction, reason, actor),
             )
             loaded = await self._load_context(record, override_payload=effective_payload)
             issues = await self._collect_validation_issues(loaded)
@@ -174,13 +183,16 @@ class TransferWorker:
                 TransferStatus.WAITING_REVIEW,
                 TransferStatus.QUEUED,
                 correction,
-                _REVIEW_ACTOR,
+                actor,
                 reason or "manual correction",
                 {
-                    "actor": _REVIEW_ACTOR,
+                    "actor": actor,
                     "decision": decision,
                     "reason": reason,
                 },
+                clear_result=True,
+                clear_error=True,
+                clear_completed_at=True,
             )
 
         latest_correction = await self._store.get_latest_review_correction(tenant_id, transfer_id)
@@ -195,10 +207,13 @@ class TransferWorker:
             TransferStatus.WAITING_REVIEW,
             TransferStatus.QUEUED,
             {
-                "actor": _REVIEW_ACTOR,
+                "actor": actor,
                 "decision": decision,
                 "reason": reason,
             },
+            clear_result=True,
+            clear_error=True,
+            clear_completed_at=True,
         )
 
     async def reconcile_transfer(self, tenant_id: str, transfer_id: str) -> TransferRecord:
@@ -250,7 +265,10 @@ class TransferWorker:
     async def _run_loop(self) -> None:
         await self.recover_inflight()
         while not self._stop_event.is_set():
-            worked = await self.run_once()
+            try:
+                worked = await self.run_once()
+            except Exception:
+                worked = True
             if worked:
                 continue
             try:
@@ -312,6 +330,7 @@ class TransferWorker:
         duration_ms = 0
         request_id: str | None = None
         loaded: _LoadedContext | None = None
+        send_started = False
         try:
             loaded = await self._load_context(record)
             parts = self._mapping_engine.apply(
@@ -330,11 +349,15 @@ class TransferWorker:
                     _delivery_event_detail(record.attempt, "CANCELLED", 0, None),
                 )
                 return
+            send_started = True
             outcome = await loaded.connector.send(request)
             classification = loaded.connector.classify_error(outcome)
             duration_ms = outcome.elapsed_ms
             request_id = outcome.request_id
         except Exception as exc:
+            if not send_started:
+                await self._finalize_pre_send_failure(record, exc)
+                return
             if loaded is None:
                 loaded = await self._load_context(record)
             classification = loaded.connector.classify_error(exc)
@@ -346,7 +369,6 @@ class TransferWorker:
                 request_id,
                 exception=exc,
             )
-            await _close_connector(loaded.connector)
             return
 
         try:
@@ -387,25 +409,42 @@ class TransferWorker:
             )
             return
 
-        if classification.delivery_state == "not_sent":
-            if self._should_retry(record.attempt, outcome.status_code, classification):
-                delay_seconds = self._retry_delay_seconds(record.attempt, classification)
+        if self._should_retry(record.attempt, outcome.status_code, classification):
+            if expected == TransferStatus.CANCELLATION_REQUESTED:
                 await self._store.transition_state(
                     record.tenant_id,
                     record.transfer_id,
                     expected,
-                    TransferStatus.RETRYING,
+                    TransferStatus.FAILED,
                     detail,
-                    next_retry_at=_utc_now() + timedelta(seconds=delay_seconds),
                     error=_problem_detail(
                         code=classification.code,
-                        title="Transfer delivery will retry",
+                        title="Transfer delivery failed",
                         detail=classification.code,
-                        retryable=True,
+                        retryable=False,
                         correlation_id=record.correlation_id,
                     ),
                 )
                 return
+            delay_seconds = self._retry_delay_seconds(record.attempt, classification)
+            await self._store.transition_state(
+                record.tenant_id,
+                record.transfer_id,
+                expected,
+                TransferStatus.RETRYING,
+                detail,
+                next_retry_at=_utc_now() + timedelta(seconds=delay_seconds),
+                error=_problem_detail(
+                    code=classification.code,
+                    title="Transfer delivery will retry",
+                    detail=classification.code,
+                    retryable=True,
+                    correlation_id=record.correlation_id,
+                ),
+            )
+            return
+
+        if classification.delivery_state == "not_sent":
             target = TransferStatus.CANCELLED if expected == TransferStatus.CANCELLATION_REQUESTED else TransferStatus.FAILED
             await self._store.transition_state(
                 record.tenant_id,
@@ -458,21 +497,59 @@ class TransferWorker:
             )
             return
 
-        parsed = loaded.connector.parse_response(outcome)
-        target_resource_id = _validated_target_resource_id(parsed)
-        reconcile_result = await loaded.connector.reconcile(
-            ReconciliationContext(
-                transfer_id=record.transfer_id,
-                idempotency_key=record.idempotency_key,
-                deduplication_value=_canonical_deduplication_value(
-                    loaded.effective_payload,
-                    loaded.mapping.deduplication_key_path,
+        try:
+            parsed = loaded.connector.parse_response(outcome)
+            target_resource_id = _validated_target_resource_id(parsed)
+        except Exception as exc:
+            await self._store.transition_state(
+                record.tenant_id,
+                record.transfer_id,
+                expected,
+                TransferStatus.FAILED,
+                detail,
+                error=_problem_detail(
+                    code=_error_code(exc),
+                    title="Transfer response parsing failed",
+                    detail=str(exc),
+                    retryable=False,
+                    correlation_id=record.correlation_id,
                 ),
-                operation_id=loaded.operation.operation_id,
-                mode="postcondition",
-                target_resource_id=target_resource_id,
             )
-        )
+            return
+
+        try:
+            reconcile_result = await loaded.connector.reconcile(
+                ReconciliationContext(
+                    transfer_id=record.transfer_id,
+                    idempotency_key=record.idempotency_key,
+                    deduplication_value=_canonical_deduplication_value(
+                        loaded.effective_payload,
+                        loaded.mapping.deduplication_key_path,
+                    ),
+                    operation_id=loaded.operation.operation_id,
+                    mode="postcondition",
+                    target_resource_id=target_resource_id,
+                )
+            )
+        except Exception as exc:
+            parsed.completed_at = _utc_now()
+            await self._store.transition_state(
+                record.tenant_id,
+                record.transfer_id,
+                expected,
+                TransferStatus.RECONCILIATION_REQUIRED,
+                detail,
+                result=parsed,
+                error=_problem_detail(
+                    code=_error_code(exc),
+                    title="Transfer requires reconciliation",
+                    detail=str(exc),
+                    retryable=False,
+                    correlation_id=record.correlation_id,
+                ),
+            )
+            return
+
         parsed.target_resource_id = reconcile_result.target_resource_id or target_resource_id
         parsed.postcondition_verified = reconcile_result.state == "registered"
         parsed.completed_at = _utc_now()
@@ -585,6 +662,55 @@ class TransferWorker:
             ),
         )
 
+    async def _finalize_pre_send_failure(
+        self,
+        record: TransferRecord,
+        exception: Exception,
+    ) -> None:
+        current = await self._require_record(record.tenant_id, record.transfer_id)
+        expected = (
+            TransferStatus.CANCELLATION_REQUESTED
+            if current.status == TransferStatus.CANCELLATION_REQUESTED
+            else TransferStatus.DELIVERING
+        )
+        code = _error_code(exception)
+        detail = _delivery_event_detail(record.attempt, code, 0, None)
+
+        if expected == TransferStatus.CANCELLATION_REQUESTED:
+            await self._store.transition_state(
+                record.tenant_id,
+                record.transfer_id,
+                expected,
+                TransferStatus.CANCELLED,
+                detail,
+            )
+            return
+
+        target = (
+            TransferStatus.WAITING_REVIEW
+            if _is_reviewable_pre_send_failure(exception)
+            else TransferStatus.FAILED
+        )
+        title = (
+            "Transfer requires review before delivery"
+            if target == TransferStatus.WAITING_REVIEW
+            else "Transfer delivery preparation failed"
+        )
+        await self._store.transition_state(
+            record.tenant_id,
+            record.transfer_id,
+            expected,
+            target,
+            detail,
+            error=_problem_detail(
+                code=code,
+                title=title,
+                detail=str(exception),
+                retryable=False,
+                correlation_id=record.correlation_id,
+            ),
+        )
+
     async def _load_context(
         self,
         record: TransferRecord,
@@ -661,11 +787,15 @@ class TransferWorker:
         status_code: int | None,
         classification: ErrorClassification,
     ) -> bool:
-        if classification.delivery_state != "not_sent" or not classification.retryable:
+        if not classification.retryable:
             return False
         if attempt >= self._retry_policy.max_attempts:
             return False
-        return status_code is None or status_code in self._retry_policy.retry_statuses
+        if classification.delivery_state == "not_sent":
+            return status_code is None or status_code in self._retry_policy.retry_statuses
+        if classification.delivery_state == "received":
+            return status_code is not None and status_code in self._retry_policy.retry_statuses
+        return False
 
 
 def _context_issues(
@@ -775,6 +905,13 @@ def _error_code(error: Exception) -> str:
     return str(error) if str(error) else error.__class__.__name__
 
 
+def _is_reviewable_pre_send_failure(error: Exception) -> bool:
+    if not isinstance(error, MappingValidationError):
+        return False
+    detail = str(error)
+    return "requires review" in detail or "LOW_CONFIDENCE" in detail
+
+
 def _delivery_event_detail(
     attempt: int,
     classification: str,
@@ -816,13 +953,13 @@ def _canonical_deduplication_value(payload: TransferRequest, pointer: str) -> st
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _review_correction_model(values: dict[str, Any], reason: str | None):
+def _review_correction_model(values: dict[str, Any], reason: str | None, actor: str):
     from .models import ReviewCorrection
 
     return ReviewCorrection(
         correction_ref="review://pending",
         values=values,
-        actor=_REVIEW_ACTOR,
+        actor=actor,
         reason=reason or "manual correction",
     )
 

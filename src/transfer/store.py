@@ -59,6 +59,7 @@ ALLOWED_TRANSITIONS = {
         TransferStatus.CANCELLED,
     },
     TransferStatus.DELIVERING: {
+        TransferStatus.WAITING_REVIEW,
         TransferStatus.SUCCEEDED,
         TransferStatus.PARTIALLY_SUCCEEDED,
         TransferStatus.RETRYING,
@@ -159,6 +160,9 @@ class TransferStore(Protocol):
         next_retry_at: datetime | None = None,
         result: TransferResult | dict[str, Any] | None = None,
         error: ProblemDetail | dict[str, Any] | None = None,
+        clear_result: bool = False,
+        clear_error: bool = False,
+        clear_completed_at: bool = False,
     ) -> TransferRecord: ...
 
     async def recover_inflight(self) -> int: ...
@@ -206,6 +210,9 @@ class TransferStore(Protocol):
         next_retry_at: datetime | None = None,
         result: TransferResult | dict[str, Any] | None = None,
         error: ProblemDetail | dict[str, Any] | None = None,
+        clear_result: bool = False,
+        clear_error: bool = False,
+        clear_completed_at: bool = False,
     ) -> TransferRecord: ...
 
     async def get_latest_review_correction(
@@ -784,6 +791,9 @@ class SqliteTransferStore:
         next_retry_at: datetime | None = None,
         result: TransferResult | dict[str, Any] | None = None,
         error: ProblemDetail | dict[str, Any] | None = None,
+        clear_result: bool = False,
+        clear_error: bool = False,
+        clear_completed_at: bool = False,
     ) -> TransferRecord:
         connection = self._require_connection()
         await connection.execute("BEGIN IMMEDIATE")
@@ -814,6 +824,9 @@ class SqliteTransferStore:
                 next_retry_at=next_retry_at,
                 result=result,
                 error=error,
+                clear_result=clear_result,
+                clear_error=clear_error,
+                clear_completed_at=clear_completed_at,
             )
             await connection.commit()
             return updated
@@ -976,6 +989,9 @@ class SqliteTransferStore:
         next_retry_at: datetime | None = None,
         result: TransferResult | dict[str, Any] | None = None,
         error: ProblemDetail | dict[str, Any] | None = None,
+        clear_result: bool = False,
+        clear_error: bool = False,
+        clear_completed_at: bool = False,
     ) -> TransferRecord:
         connection = self._require_connection()
         await connection.execute("BEGIN IMMEDIATE")
@@ -1043,6 +1059,9 @@ class SqliteTransferStore:
                 next_retry_at=next_retry_at,
                 result=result,
                 error=error,
+                clear_result=clear_result,
+                clear_error=clear_error,
+                clear_completed_at=clear_completed_at,
             )
             await connection.commit()
             return updated
@@ -1219,6 +1238,9 @@ class SqliteTransferStore:
         next_retry_at: datetime | str | None = None,
         result: TransferResult | dict[str, Any] | None = None,
         error: ProblemDetail | dict[str, Any] | None = None,
+        clear_result: bool = False,
+        clear_error: bool = False,
+        clear_completed_at: bool = False,
     ) -> TransferRecord:
         current_status = TransferStatus(row["status"])
         attempt = int(row["attempt"]) + (1 if increment_attempt else 0)
@@ -1234,6 +1256,10 @@ class SqliteTransferStore:
 
         existing_result = json.loads(row["result_json"]) if row["result_json"] else None
         existing_error = json.loads(row["error_json"]) if row["error_json"] else None
+        if clear_result:
+            existing_result = None
+        if clear_error:
+            existing_error = None
         if result is not None:
             result_model = (
                 result if isinstance(result, TransferResult) else TransferResult.model_validate(result)
@@ -1246,7 +1272,9 @@ class SqliteTransferStore:
             existing_error = error_model.model_dump(mode="json")
 
         completed_at = row["completed_at"]
-        if target in TERMINAL_STATUSES:
+        if clear_completed_at:
+            completed_at = None
+        elif target in TERMINAL_STATUSES:
             completed_at = _isoformat(now)
 
         cursor = await connection.execute(

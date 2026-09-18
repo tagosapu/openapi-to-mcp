@@ -505,6 +505,141 @@ async def test_transition_rejects_stale_update_without_appending_phantom_event(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_status", "target_status"),
+    [
+        ("failed", "queued"),
+        ("waiting_review", "queued"),
+    ],
+)
+async def test_transition_state_clears_stale_result_error_and_completed_at_when_reactivating(
+    store, initial_status: str, target_status: str
+) -> None:
+    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+
+    await store.save_connector(
+        ConnectorDefinition.model_validate(sample_connector_definition()),
+        tenant_id="tenant-a",
+    )
+    await store.save_mapping(
+        MappingDefinition.model_validate(sample_mapping()),
+        tenant_id="tenant-a",
+    )
+    created = await store.create_or_get_transfer(
+        tenant_id="tenant-a",
+        idempotency_key=f"reactivate-{initial_status}",
+        request=TransferRequest.model_validate(sample_transfer_request()),
+        correlation_id=f"corr-reactivate-{initial_status}",
+        connector_version=7,
+        mapping_version=3,
+    )
+    transfer_id = created.record.transfer_id
+    expected = TransferStatus(initial_status)
+    target = TransferStatus(target_status)
+    await store.transition(
+        "tenant-a",
+        transfer_id,
+        TransferStatus.ACCEPTED,
+        TransferStatus.VALIDATING,
+        {"reason": "validation started"},
+    )
+    if expected == TransferStatus.WAITING_REVIEW:
+        await store.transition(
+            "tenant-a",
+            transfer_id,
+            TransferStatus.VALIDATING,
+            TransferStatus.WAITING_REVIEW,
+            {"reason": "needs review"},
+        )
+    else:
+        await store.transition(
+            "tenant-a",
+            transfer_id,
+            TransferStatus.VALIDATING,
+            TransferStatus.QUEUED,
+            {"reason": "validated"},
+        )
+        claimed = await store.claim_due_transfer(datetime(2026, 9, 18, tzinfo=UTC))
+        assert claimed is not None
+        await store.transition_state(
+            "tenant-a",
+            transfer_id,
+            TransferStatus.DELIVERING,
+            TransferStatus.FAILED,
+            {"reason": "delivery failed"},
+            result={
+                "target_resource_id": "stale-target",
+                "target_request_id": "stale-request",
+                "postcondition_verified": False,
+                "completed_at": "2026-09-18T00:00:00Z",
+                "response_ref": None,
+            },
+            error={
+                "type": "https://openapi-to-mcp/errors/stale",
+                "title": "stale error",
+                "status": 422,
+                "code": "STALE_ERROR",
+                "detail": "stale detail",
+                "correlation_id": "corr-reactivate-failed",
+                "retryable": False,
+                "errors": [],
+            },
+        )
+
+    connection = store._require_connection()
+    await connection.execute(
+        """
+        UPDATE transfers
+        SET result_json = ?, error_json = ?, completed_at = ?
+        WHERE tenant_id = ? AND transfer_id = ?
+        """,
+        (
+            json.dumps(
+                {
+                    "target_resource_id": "stale-target",
+                    "target_request_id": "stale-request",
+                    "postcondition_verified": False,
+                    "completed_at": "2026-09-18T00:00:00Z",
+                    "response_ref": None,
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "https://openapi-to-mcp/errors/stale",
+                    "title": "stale error",
+                    "status": 422,
+                    "code": "STALE_ERROR",
+                    "detail": "stale detail",
+                    "correlation_id": f"corr-reactivate-{initial_status}",
+                    "retryable": False,
+                    "errors": [],
+                }
+            ),
+            "2026-09-18T00:00:00Z",
+            "tenant-a",
+            transfer_id,
+        ),
+    )
+    await connection.commit()
+
+    updated = await store.transition_state(
+        "tenant-a",
+        transfer_id,
+        expected,
+        target,
+        {"reason": "reactivate"},
+        clear_result=True,
+        clear_error=True,
+        clear_completed_at=True,
+    )
+
+    assert updated.status == TransferStatus.QUEUED
+    assert updated.result is None
+    assert updated.error is None
+    assert updated.completed_at is None
+
+
+@pytest.mark.asyncio
 async def test_recover_inflight_skips_stale_rows_without_appending_phantom_event(
     store, monkeypatch
 ) -> None:
