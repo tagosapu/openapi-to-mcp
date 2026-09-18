@@ -378,11 +378,11 @@ async def test_claim_cancel_and_recover_follow_required_state_machine(store) -> 
     recovered_validate = await store.get_transfer("tenant-a", claimed_validate.record.transfer_id)
     recovered_deliver = await store.get_transfer("tenant-a", claimed_deliver.record.transfer_id)
 
-    assert recovered == 0
+    assert recovered == 2
     assert recovered_validate is not None
-    assert recovered_validate.status == TransferStatus.VALIDATING
+    assert recovered_validate.status == TransferStatus.ACCEPTED
     assert recovered_deliver is not None
-    assert recovered_deliver.status == TransferStatus.CANCELLATION_REQUESTED
+    assert recovered_deliver.status == TransferStatus.RECONCILIATION_REQUIRED
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ from .openapi_contract import ContractPreflight, ContractPreflightResult
 from .rest_connector import ConnectorRegistry, RestOpenApiConnector
 from .settings import TransferSettings
 from .store import FernetPayloadProtector, PayloadProtector, SqliteTransferStore, TransferStore, create_payload_protector
+from .worker import RetryPolicy, TransferWorker
 
 __all__ = [
     "AdditionalHeader",
@@ -87,5 +88,7 @@ __all__ = [
     "TransferSettings",
     "TransferStatus",
     "TransferStore",
+    "RetryPolicy",
+    "TransferWorker",
     "create_payload_protector",
 ]

@@ -76,12 +76,16 @@ ALLOWED_TRANSITIONS = {
         TransferStatus.SUCCEEDED,
         TransferStatus.FAILED,
         TransferStatus.DELIVERING,
+        TransferStatus.QUEUED,
     },
     TransferStatus.CANCELLATION_REQUESTED: {
         TransferStatus.SUCCEEDED,
         TransferStatus.FAILED,
         TransferStatus.RECONCILIATION_REQUIRED,
         TransferStatus.CANCELLED,
+    },
+    TransferStatus.FAILED: {
+        TransferStatus.QUEUED,
     },
 }
 
@@ -144,6 +148,19 @@ class TransferStore(Protocol):
         detail: dict[str, Any],
     ) -> TransferRecord: ...
 
+    async def transition_state(
+        self,
+        tenant_id: str,
+        transfer_id: str,
+        expected: TransferStatus,
+        target: TransferStatus,
+        detail: dict[str, Any],
+        *,
+        next_retry_at: datetime | None = None,
+        result: TransferResult | dict[str, Any] | None = None,
+        error: ProblemDetail | dict[str, Any] | None = None,
+    ) -> TransferRecord: ...
+
     async def recover_inflight(self) -> int: ...
 
     async def cancel_transfer(
@@ -174,6 +191,22 @@ class TransferStore(Protocol):
         actor: str,
         reason: str,
     ) -> ReviewCorrection: ...
+
+    async def save_review_correction_and_transition(
+        self,
+        tenant_id: str,
+        transfer_id: str,
+        expected: TransferStatus,
+        target: TransferStatus,
+        values: dict[str, Any],
+        actor: str,
+        reason: str,
+        detail: dict[str, Any],
+        *,
+        next_retry_at: datetime | None = None,
+        result: TransferResult | dict[str, Any] | None = None,
+        error: ProblemDetail | dict[str, Any] | None = None,
+    ) -> TransferRecord: ...
 
     async def get_latest_review_correction(
         self, tenant_id: str, transfer_id: str
@@ -729,6 +762,29 @@ class SqliteTransferStore:
         target: TransferStatus,
         detail: dict[str, Any],
     ) -> TransferRecord:
+        return await self.transition_state(
+            tenant_id,
+            transfer_id,
+            expected,
+            target,
+            detail,
+            next_retry_at=detail.get("next_retry_at"),
+            result=detail.get("result"),
+            error=detail.get("error"),
+        )
+
+    async def transition_state(
+        self,
+        tenant_id: str,
+        transfer_id: str,
+        expected: TransferStatus,
+        target: TransferStatus,
+        detail: dict[str, Any],
+        *,
+        next_retry_at: datetime | None = None,
+        result: TransferResult | dict[str, Any] | None = None,
+        error: ProblemDetail | dict[str, Any] | None = None,
+    ) -> TransferRecord:
         connection = self._require_connection()
         await connection.execute("BEGIN IMMEDIATE")
         try:
@@ -755,9 +811,9 @@ class SqliteTransferStore:
                 detail=detail,
                 now=now,
                 increment_attempt=False,
-                next_retry_at=detail.get("next_retry_at"),
-                result=detail.get("result"),
-                error=detail.get("error"),
+                next_retry_at=next_retry_at,
+                result=result,
+                error=error,
             )
             await connection.commit()
             return updated
@@ -773,8 +829,16 @@ class SqliteTransferStore:
         await connection.execute("BEGIN IMMEDIATE")
         try:
             rows_cursor = await connection.execute(
-                "SELECT * FROM transfers WHERE status = ? ORDER BY created_at ASC, transfer_id ASC",
-                (TransferStatus.DELIVERING.value,),
+                """
+                SELECT * FROM transfers
+                WHERE status IN (?, ?, ?)
+                ORDER BY created_at ASC, transfer_id ASC
+                """,
+                (
+                    TransferStatus.DELIVERING.value,
+                    TransferStatus.CANCELLATION_REQUESTED.value,
+                    TransferStatus.VALIDATING.value,
+                ),
             )
             rows = await rows_cursor.fetchall()
             await rows_cursor.close()
@@ -784,13 +848,20 @@ class SqliteTransferStore:
             now = _utc_now()
             recovered = 0
             for row in rows:
+                current_status = TransferStatus(row["status"])
+                if current_status == TransferStatus.VALIDATING:
+                    target = TransferStatus.ACCEPTED
+                    detail = {"reason": "startup recovery", "phase": "validate"}
+                else:
+                    target = TransferStatus.RECONCILIATION_REQUIRED
+                    detail = {"reason": "startup recovery", "phase": "deliver"}
                 try:
                     await self._update_transfer_status(
                         connection,
                         row=row,
-                        target=TransferStatus.RECONCILIATION_REQUIRED,
+                        target=target,
                         event_type="recover",
-                        detail={"reason": "startup recovery"},
+                        detail=detail,
                         now=now,
                         increment_attempt=False,
                     )
@@ -890,6 +961,97 @@ class SqliteTransferStore:
         )
         await connection.commit()
         return correction
+
+    async def save_review_correction_and_transition(
+        self,
+        tenant_id: str,
+        transfer_id: str,
+        expected: TransferStatus,
+        target: TransferStatus,
+        values: dict[str, Any],
+        actor: str,
+        reason: str,
+        detail: dict[str, Any],
+        *,
+        next_retry_at: datetime | None = None,
+        result: TransferResult | dict[str, Any] | None = None,
+        error: ProblemDetail | dict[str, Any] | None = None,
+    ) -> TransferRecord:
+        connection = self._require_connection()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = await self._get_transfer_row_any_tenant(connection, transfer_id)
+            if row is None:
+                raise NotFoundError("transfer not found")
+            if row["tenant_id"] != tenant_id:
+                raise TenantIsolationError("transfer belongs to another tenant")
+            actual = TransferStatus(row["status"])
+            if actual != expected:
+                raise InvalidTransitionError(
+                    f"expected {expected.value}, found {actual.value}"
+                )
+            if target not in ALLOWED_TRANSITIONS.get(expected, set()):
+                raise InvalidTransitionError(
+                    f"transition {expected.value} -> {target.value} is not allowed"
+                )
+
+            correction_ref = str(uuid4())
+            correction = ReviewCorrection(
+                correction_ref=correction_ref,
+                values=values,
+                actor=actor,
+                reason=reason,
+            )
+            now = _utc_now()
+            await connection.execute(
+                """
+                INSERT INTO review_corrections (
+                    correction_ref, tenant_id, transfer_id, correction_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    correction_ref,
+                    tenant_id,
+                    transfer_id,
+                    self._encode_correction_payload(values),
+                    _isoformat(now),
+                ),
+            )
+            await self._append_event(
+                connection,
+                tenant_id=tenant_id,
+                transfer_id=transfer_id,
+                from_status=actual,
+                to_status=actual,
+                event_type="review_correction",
+                detail={
+                    "actor": actor,
+                    "reason": reason,
+                    "correction_ref": correction_ref,
+                },
+                correction_ref=correction.correction_ref,
+                created_at=now,
+            )
+            updated = await self._update_transfer_status(
+                connection,
+                row=row,
+                target=target,
+                event_type="transition",
+                detail=detail,
+                now=now,
+                increment_attempt=False,
+                next_retry_at=next_retry_at,
+                result=result,
+                error=error,
+            )
+            await connection.commit()
+            return updated
+        except _StaleTransferStateError as exc:
+            await connection.rollback()
+            raise InvalidTransitionError("transfer changed state during transition") from exc
+        except Exception:
+            await connection.rollback()
+            raise
 
     async def get_latest_review_correction(
         self, tenant_id: str, transfer_id: str
