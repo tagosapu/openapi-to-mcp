@@ -27,6 +27,7 @@ _ALLOWED_TRANSFORMS = {
     "to_date",
     "to_datetime",
     "currency_amount",
+    "concat",
 }
 
 
@@ -50,7 +51,7 @@ class MappingEngine:
 
         document = payload.model_dump(mode="json")
         for pointer, value in correction.values.items():
-            _set_pointer(document, pointer, deepcopy(value), create_missing=False)
+            document = _set_pointer(document, pointer, deepcopy(value), create_missing=False)
         return TransferRequest.model_validate(document)
 
     def preview(
@@ -124,7 +125,7 @@ class MappingEngine:
                 raise MappingValidationError(f"required value is empty for rule {rule.rule_id}")
 
             value = self._apply_enum_map(rule, value)
-            value = self._apply_transforms(document, rule, value)
+            value = self._apply_transforms(rule, value)
             if rule.required and _is_empty_value(value):
                 raise MappingValidationError(f"required value is empty for rule {rule.rule_id}")
 
@@ -202,47 +203,13 @@ class MappingEngine:
         value_key = str(value)
         return rule.enum_map.get(value_key, value)
 
-    def _apply_transforms(self, document: dict[str, Any], rule: MappingRule, value: Any) -> Any:
+    def _apply_transforms(self, rule: MappingRule, value: Any) -> Any:
         transformed = value
         for transform in rule.transforms:
-            if transform.startswith("concat:"):
-                transformed = self._apply_concat(document, transform, transformed, rule.rule_id)
-                continue
             if transform not in _ALLOWED_TRANSFORMS:
                 raise MappingValidationError(f"unsupported transform {transform} for rule {rule.rule_id}")
             transformed = _apply_transform(transform, transformed, rule.rule_id)
         return transformed
-
-    def _apply_concat(
-        self,
-        document: dict[str, Any],
-        transform: str,
-        current: Any,
-        rule_id: str,
-    ) -> str:
-        payload = transform.split(":", 1)[1]
-        try:
-            parts = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise MappingValidationError(f"invalid concat transform for rule {rule_id}") from exc
-        if not isinstance(parts, list):
-            raise MappingValidationError(f"invalid concat transform for rule {rule_id}")
-
-        rendered: list[str] = []
-        for item in parts:
-            if item == "$":
-                rendered.append(_stringify(current))
-                continue
-            if isinstance(item, str) and item.startswith("/"):
-                resolved = _resolve_pointer(document, item)
-                if resolved is _MISSING:
-                    raise MappingValidationError(
-                        f"source pointer missing inside concat for rule {rule_id}"
-                    )
-                rendered.append(_stringify(resolved))
-                continue
-            rendered.append(_stringify(item))
-        return "".join(rendered)
 
     def _condition_matches(self, document: dict[str, Any], rule: MappingRule) -> bool:
         assert rule.condition is not None
@@ -337,6 +304,8 @@ def _apply_transform(transform: str, value: Any, rule_id: str) -> Any:
         return _to_date(value, rule_id)
     if transform == "to_datetime":
         return _to_datetime(value, rule_id)
+    if transform == "concat":
+        return _concat(value, rule_id)
     return _currency_amount(value, rule_id)
 
 
@@ -351,7 +320,12 @@ def _to_integer(value: Any, rule_id: str) -> int:
         return int(value)
     if isinstance(value, str):
         normalized = value.strip().replace(",", "")
-        return int(normalized)
+        try:
+            return int(normalized)
+        except (OverflowError, ValueError) as exc:
+            raise MappingValidationError(
+                f"to_integer could not parse value for rule {rule_id}"
+            ) from exc
     raise MappingValidationError(f"to_integer requires scalar input for rule {rule_id}")
 
 
@@ -371,9 +345,30 @@ def _to_number(value: Any, rule_id: str) -> int | float:
             .replace("€", "")
             .replace("£", "")
         )
-        parsed = float(normalized)
+        try:
+            parsed = float(normalized)
+        except (OverflowError, ValueError) as exc:
+            raise MappingValidationError(
+                f"to_number could not parse value for rule {rule_id}"
+            ) from exc
+        if not math.isfinite(parsed):
+            raise MappingValidationError(f"to_number rejects non-finite values for rule {rule_id}")
         return int(parsed) if parsed.is_integer() else parsed
     raise MappingValidationError(f"to_number requires scalar input for rule {rule_id}")
+
+
+def _concat(value: Any, rule_id: str) -> str:
+    if not isinstance(value, (list, tuple)):
+        raise MappingValidationError(f"concat requires list or tuple input for rule {rule_id}")
+
+    rendered: list[str] = []
+    for item in value:
+        if isinstance(item, (dict, list, tuple)):
+            raise MappingValidationError(
+                f"concat requires scalar items for rule {rule_id}"
+            )
+        rendered.append(_stringify(item))
+    return "".join(rendered)
 
 
 def _to_date(value: Any, rule_id: str) -> str:

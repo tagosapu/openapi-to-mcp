@@ -124,6 +124,12 @@ def test_mapping_applies_default_enum_condition_concat_and_line_items() -> None:
         "confidence": 0.96,
         "status": "extracted",
     }
+    payload["ocr"]["fields"]["summary_parts"] = {
+        "value": ["Invoice ", "INV-0001", " for ", "invoice"],
+        "value_type": "array",
+        "confidence": 0.96,
+        "status": "extracted",
+    }
     mapping = _mapping(
         [
             {
@@ -154,11 +160,11 @@ def test_mapping_applies_default_enum_condition_concat_and_line_items() -> None:
             },
             {
                 "rule_id": "summary",
-                "source": "/ocr/fields/invoice_number/value",
+                "source": "/ocr/fields/summary_parts/value",
                 "target": {"location": "body", "pointer": "/summary"},
                 "required": True,
                 "on_missing": "error",
-                "transforms": ["trim", "concat:[\"Invoice \", \"$\", \" for \", \"/document/document_type\"]"],
+                "transforms": ["concat"],
             },
             {
                 "rule_id": "line-items",
@@ -194,6 +200,24 @@ def test_mapping_applies_default_enum_condition_concat_and_line_items() -> None:
         "note": "n/a",
         "summary": "Invoice INV-0001 for invoice",
     }
+
+
+def test_mapping_rejects_concat_on_non_list_input() -> None:
+    mapping = _mapping(
+        [
+            {
+                "rule_id": "summary",
+                "source": "/ocr/fields/invoice_number/value",
+                "target": {"location": "body", "pointer": "/summary"},
+                "required": True,
+                "on_missing": "error",
+                "transforms": ["concat"],
+            }
+        ]
+    )
+
+    with pytest.raises(MappingValidationError, match="concat"):
+        MappingEngine().preview(_request(), mapping, _operation())
 
 
 def test_mapping_handles_allowed_type_conversions() -> None:
@@ -360,6 +384,28 @@ def test_apply_corrections_overlays_without_mutating_original() -> None:
     assert request.model_dump(mode="json") == original
     assert corrected.ocr.fields["invoice_number"].value == "INV-0099"
     assert corrected.ocr.fields["invoice_number"].status == "manually_corrected"
+
+
+def test_apply_corrections_supports_root_pointer_without_mutating_original() -> None:
+    request = _request()
+    original = request.model_dump(mode="json")
+    replacement = deepcopy(original)
+    replacement["document"]["document_type"] = "receipt"
+    replacement["ocr"]["fields"]["invoice_number"]["value"] = "INV-ROOT"
+    correction = ReviewCorrection.model_validate(
+        {
+            "correction_ref": "object://reviews/correction-root",
+            "values": {"": replacement},
+            "actor": "reviewer@example.com",
+            "reason": "replace payload with approved snapshot",
+        }
+    )
+
+    corrected = MappingEngine().apply_corrections(request, correction)
+
+    assert request.model_dump(mode="json") == original
+    assert corrected.document.document_type == "receipt"
+    assert corrected.ocr.fields["invoice_number"].value == "INV-ROOT"
 
 
 def test_mapping_rejects_unknown_pointers() -> None:
@@ -539,3 +585,40 @@ def test_apply_builds_canonical_idempotency_key() -> None:
     assert outbound.headers == {}
     assert outbound.json_body == {"external_id": "INV-001"}
     assert outbound.idempotency_key == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("transform", "field_name", "field_value", "pattern"),
+    [
+        ("to_integer", "bad_integer", "not-a-number", "to_integer"),
+        ("to_number", "bad_number", "not-a-number", "to_number"),
+    ],
+)
+def test_mapping_wraps_invalid_numeric_conversions(
+    transform: str,
+    field_name: str,
+    field_value: str,
+    pattern: str,
+) -> None:
+    payload = sample_transfer_request(line_items=0)
+    payload["ocr"]["fields"][field_name] = {
+        "value": field_value,
+        "value_type": "string",
+        "confidence": 0.95,
+        "status": "extracted",
+    }
+    mapping = _mapping(
+        [
+            {
+                "rule_id": f"rule-{field_name}",
+                "source": f"/ocr/fields/{field_name}/value",
+                "target": {"location": "body", "pointer": f"/{field_name}"},
+                "required": True,
+                "on_missing": "error",
+                "transforms": [transform],
+            }
+        ]
+    )
+
+    with pytest.raises(MappingValidationError, match=pattern):
+        MappingEngine().preview(_request(payload), mapping, _operation())

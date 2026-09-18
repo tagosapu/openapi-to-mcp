@@ -11,7 +11,13 @@ from uuid import uuid4
 
 import aiosqlite
 
-from .errors import IdempotencyConflict, InvalidTransitionError, NotFoundError, TenantIsolationError
+from .errors import (
+    IdempotencyConflict,
+    InvalidTransitionError,
+    MappingValidationError,
+    NotFoundError,
+    TenantIsolationError,
+)
 from .models import (
     ClaimedTransfer,
     ConnectorDefinition,
@@ -501,6 +507,8 @@ class SqliteTransferStore:
             mapping = await self.get_mapping(tenant_id, request.delivery.mapping_id, mapping_version)
             if mapping is None:
                 raise NotFoundError("mapping version not found for tenant")
+            if request.delivery.deduplication_key_path != mapping.deduplication_key_path:
+                raise MappingValidationError("deduplication_key_path does not match mapping")
 
             transfer_id = str(uuid4())
             idempotency_expires_at = now + self._idempotency_retention

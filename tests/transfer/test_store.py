@@ -162,6 +162,43 @@ async def test_create_or_get_transfer_is_tenant_scoped_and_detects_hash_conflict
 
 
 @pytest.mark.asyncio
+async def test_create_or_get_transfer_rejects_deduplication_path_mismatch_before_persist(store) -> None:
+    from src.transfer.errors import MappingValidationError
+    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest
+
+    await store.save_connector(
+        ConnectorDefinition.model_validate(sample_connector_definition()),
+        tenant_id="tenant-a",
+    )
+    mismatched_mapping = sample_mapping()
+    mismatched_mapping["deduplication_key_path"] = "/document/document_id"
+    await store.save_mapping(
+        MappingDefinition.model_validate(mismatched_mapping),
+        tenant_id="tenant-a",
+    )
+
+    with pytest.raises(MappingValidationError, match="deduplication_key_path"):
+        await store.create_or_get_transfer(
+            tenant_id="tenant-a",
+            idempotency_key="idem-mismatch",
+            request=TransferRequest.model_validate(sample_transfer_request()),
+            correlation_id="corr-mismatch",
+            connector_version=7,
+            mapping_version=3,
+        )
+
+    connection = store._require_connection()
+    cursor = await connection.execute(
+        "SELECT COUNT(*) AS count FROM transfers WHERE tenant_id = ?",
+        ("tenant-a",),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+
+    assert row["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_create_or_get_transfer_honors_retention_and_allows_reuse_after_expiry(
     tmp_path, monkeypatch
 ) -> None:
