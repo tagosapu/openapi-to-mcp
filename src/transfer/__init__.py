@@ -36,6 +36,7 @@ from .models import (
     TransferResult,
     TransferStatus,
 )
+from .mapping import MappingEngine
 from .settings import TransferSettings
 from .store import PayloadProtector, SqliteTransferStore, TransferStore
 
@@ -50,6 +51,7 @@ __all__ = [
     "InvalidTransitionError",
     "MappingCondition",
     "MappingDefinition",
+    "MappingEngine",
     "MappingIssue",
     "MappingPreview",
     "MappingRule",
