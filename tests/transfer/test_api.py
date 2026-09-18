@@ -6,11 +6,13 @@ from typing import Any
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from src.transfer.app import create_app, current_principal
 from src.transfer.auth import Principal
 from src.transfer.limits import RateLimiter
 from src.transfer.models import TransferStatus
+from src.transfer.routes import ApiError, _read_json_body
 from tests.transfer.conftest import (
     sample_connector_definition,
     sample_mapping,
@@ -93,6 +95,9 @@ def _seed_dependencies(authenticated_client: TestClient) -> None:
 
 def _valid_connector_definition() -> dict[str, Any]:
     connector = sample_connector_definition()
+    operation_bindings = connector.pop("operation_bindings")
+    connector.pop("version")
+    connector.pop("spec_ref")
     connector["spec"] = {
         "openapi": "3.1.0",
         "info": {"title": "Connector Test", "version": "1.0.0"},
@@ -171,8 +176,40 @@ def _valid_connector_definition() -> dict[str, Any]:
                 },
             },
         },
+        "x-openapi-to-mcp-operation-bindings": operation_bindings,
     }
     return connector
+
+
+def test_create_connector_accepts_canonical_public_shape(
+    authenticated_client: TestClient,
+) -> None:
+    response = authenticated_client.post(
+        "/v1/connectors",
+        json=_valid_connector_definition(),
+    )
+
+    assert response.status_code == 201
+    assert response.json()["display_name"] == "Connector Test"
+    assert response.json()["capabilities"] == ["upsert"]
+
+
+def test_create_connector_rejects_internal_fields_and_unresolved_spec_ref(
+    authenticated_client: TestClient,
+) -> None:
+    internal_fields = _valid_connector_definition()
+    internal_fields["version"] = 7
+    rejected = authenticated_client.post("/v1/connectors", json=internal_fields)
+
+    unresolved = _valid_connector_definition()
+    unresolved.pop("spec")
+    unresolved["spec_ref"] = "finance-api:2026-09-01"
+    unresolved_response = authenticated_client.post("/v1/connectors", json=unresolved)
+
+    assert rejected.status_code == 422
+    assert rejected.json()["code"] == "REQUEST_INVALID"
+    assert unresolved_response.status_code == 422
+    assert unresolved_response.json()["code"] == "SPEC_SNAPSHOT_UNRESOLVED"
 
 
 def test_transfer_write_requires_scope(client: TestClient, app: Any) -> None:
@@ -310,6 +347,96 @@ def test_cancel_and_status_use_worker_and_tenant_scoped_store(
     assert "request" not in status.json()
 
 
+def test_reconcile_route_forwards_operator_evidence(
+    authenticated_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_dependencies(authenticated_client)
+    created = authenticated_client.post(
+        "/v1/transfers",
+        headers={"Idempotency-Key": "idem-reconcile-route"},
+        json=sample_transfer_request(),
+    )
+    assert created.status_code == 202
+    transfer_id = created.json()["transfer_id"]
+    captured: dict[str, Any] = {}
+
+    async def fake_reconcile(
+        tenant_id: str,
+        requested_transfer_id: str,
+        *,
+        evidence: Any,
+    ) -> Any:
+        captured["tenant_id"] = tenant_id
+        captured["transfer_id"] = requested_transfer_id
+        captured["evidence"] = evidence
+        return await authenticated_client.app.state.store.get_transfer(tenant_id, requested_transfer_id)
+
+    monkeypatch.setattr(authenticated_client.app.state.worker, "reconcile_transfer", fake_reconcile)
+    response = authenticated_client.post(
+        f"/v1/transfers/{transfer_id}/reconcile",
+        json={
+            "resolution": "confirmed_present",
+            "target_resource_id": "target-operator",
+            "notes": "verified by operator",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["tenant_id"] == "tenant-a"
+    assert captured["transfer_id"] == transfer_id
+    assert captured["evidence"].resolution == "confirmed_present"
+    assert captured["evidence"].target_resource_id == "target-operator"
+    assert captured["evidence"].notes == "verified by operator"
+
+
+def test_transfer_list_uses_cursor_pagination_and_created_filters(
+    authenticated_client: TestClient,
+) -> None:
+    _seed_dependencies(authenticated_client)
+    for index in range(3):
+        payload = sample_transfer_request()
+        payload["document"]["document_id"] = f"doc-page-{index}"
+        payload["document"]["content"]["storage_ref"] = f"object://documents/doc-page-{index}"
+        payload["ocr"]["text_ref"] = f"object://ocr-text/doc-page-{index}"
+        payload["metadata"]["correlation_id"] = f"corr-page-{index}"
+        response = authenticated_client.post(
+            "/v1/transfers",
+            headers={"Idempotency-Key": f"idem-page-{index}"},
+            json=payload,
+        )
+        assert response.status_code == 202
+
+    first = authenticated_client.get("/v1/transfers?limit=2")
+    assert first.status_code == 200
+    assert len(first.json()["items"]) == 2
+    assert first.json()["next_cursor"]
+
+    second = authenticated_client.get(
+        "/v1/transfers",
+        params={"limit": 2, "cursor": first.json()["next_cursor"]},
+    )
+    assert second.status_code == 200
+    assert len(second.json()["items"]) == 1
+    assert second.json()["next_cursor"] is None
+    assert {
+        item["transfer_id"] for item in first.json()["items"]
+    }.isdisjoint({item["transfer_id"] for item in second.json()["items"]})
+
+    after = authenticated_client.get(
+        "/v1/transfers?created_after=2020-01-01T00:00:00Z&limit=10"
+    )
+    before = authenticated_client.get(
+        "/v1/transfers?created_before=2099-01-01T00:00:00Z&limit=10"
+    )
+    malformed = authenticated_client.get("/v1/transfers?cursor=not-a-cursor")
+
+    assert len(after.json()["items"]) == 3
+    assert len(before.json()["items"]) == 3
+    assert malformed.status_code == 422
+    assert malformed.json()["code"] == "CURSOR_INVALID"
+
+
 def test_health_endpoints_do_not_require_authentication(client: TestClient) -> None:
     live = client.get("/v1/health/live")
     ready = client.get("/v1/health/ready")
@@ -346,6 +473,44 @@ def test_request_limits_and_media_type_return_problem_details(
     assert "invoice_number" not in oversized.text
 
 
+@pytest.mark.asyncio
+async def test_read_json_body_enforces_limit_without_content_length(app: Any) -> None:
+    app.state.settings.max_payload_bytes = 16
+    sent = False
+    body = b'{"value":"this is too large"}'
+
+    async def receive() -> dict[str, Any]:
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/transfers",
+            "raw_path": b"/v1/transfers",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("testclient", 1234),
+            "server": ("testserver", 80),
+            "app": app,
+        },
+        receive,
+    )
+
+    with pytest.raises(ApiError) as error:
+        await _read_json_body(request, required=True)
+
+    assert error.value.status == 413
+    assert error.value.code == "PAYLOAD_TOO_LARGE"
+
+
 class _FakeClock:
     def __init__(self) -> None:
         self.value = 0.0
@@ -365,3 +530,49 @@ def test_rate_limiter_is_scoped_to_tenant_and_client() -> None:
     assert limiter.check("tenant-b", "client-a").allowed is True
     clock.value = 1.0
     assert limiter.check("tenant-a", "client-a").allowed is True
+
+
+def test_transfer_rate_limit_uses_authenticated_subject_and_returns_retry_after(
+    authenticated_client: TestClient,
+) -> None:
+    _seed_dependencies(authenticated_client)
+    authenticated_client.app.state.rate_limiter = RateLimiter(
+        requests_per_minute=60,
+        burst=1,
+        clock=_FakeClock(),
+    )
+
+    first = authenticated_client.post(
+        "/v1/transfers",
+        headers={"Idempotency-Key": "idem-rate-1", "X-Client-ID": "client-a"},
+        json=sample_transfer_request(),
+    )
+    second = authenticated_client.post(
+        "/v1/transfers",
+        headers={"Idempotency-Key": "idem-rate-2", "X-Client-ID": "client-b"},
+        json=sample_transfer_request(),
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 429
+    assert second.headers["retry-after"] == "1"
+
+
+def test_connector_write_validation_modes_are_rejected(
+    authenticated_client: TestClient,
+) -> None:
+    _seed_dependencies(authenticated_client)
+
+    write_validation = authenticated_client.post(
+        "/v1/connectors/connector-test/validate",
+        json={"mode": "dry-run-write"},
+    )
+    structural = authenticated_client.post(
+        "/v1/connectors/connector-test/validate",
+        json={"mode": "structural"},
+    )
+
+    assert write_validation.status_code == 422
+    assert write_validation.json()["code"] == "WRITE_VALIDATION_UNSUPPORTED"
+    assert structural.status_code == 202
+    assert structural.json()["status"] == "accepted"

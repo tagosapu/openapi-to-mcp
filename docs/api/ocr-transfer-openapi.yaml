@@ -139,6 +139,20 @@ paths:
           required: false
           schema:
             type: string
+        - name: created_after
+          in: query
+          required: false
+          description: Return transfers created strictly after this timestamp.
+          schema:
+            type: string
+            format: date-time
+        - name: created_before
+          in: query
+          required: false
+          description: Return transfers created strictly before this timestamp.
+          schema:
+            type: string
+            format: date-time
         - name: limit
           in: query
           required: false

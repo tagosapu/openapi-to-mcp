@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar
 from uuid import uuid4
@@ -27,20 +28,23 @@ from .limits import RateLimitDecision
 from .mapping import MappingEngine
 from .models import (
     ConnectorDefinition,
+    ConnectorCreateRequest,
     MappingDefinition,
     MappingIssue,
     MappingPreview,
     OcrDocument,
     OcrResult,
+    OperationBinding,
     ProblemDetail,
+    ReconciliationEvidence,
     TransferFilters,
     TransferMetadata,
     TransferRecord,
     TransferRequest,
     TransferStatus,
 )
-from .openapi_contract import ContractPreflight
-from .store import TransferStore
+from .openapi_contract import ContractPreflight, public_spec_hash
+from .store import TransferStore, encode_transfer_cursor
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _SAFE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
@@ -76,14 +80,6 @@ class _ReviewRequest(BaseModel):
     action: Literal["approve", "correct", "reject"]
     correction_reason: str | None = None
     corrected_fields: dict[str, Any] | None = None
-
-
-class _ReconcileRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    resolution: Literal["confirmed_present", "confirmed_absent", "unresolved"]
-    target_resource_id: str | None = None
-    notes: str | None = None
 
 
 class _MappingPreviewRequest(BaseModel):
@@ -186,6 +182,8 @@ def create_router() -> APIRouter:
         document_id: str | None = None,
         correlation_id: str | None = None,
         cursor: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
         limit: int = Query(default=50, ge=1, le=200),
         principal: Principal = Depends(require_scope("transfer:read")),
     ) -> dict[str, Any]:
@@ -196,11 +194,18 @@ def create_router() -> APIRouter:
             correlation_id=correlation_id,
             cursor=cursor,
             limit=limit,
+            created_after=created_after,
+            created_before=created_before,
         )
-        records = await _store(request).list_transfers(principal.tenant_id, filters)
+        try:
+            records = await _store(request).list_transfers(principal.tenant_id, filters)
+        except Exception as exc:
+            raise _api_error_from_exception(exc) from exc
+        has_more = len(records) > limit
+        page = records[:limit]
         return {
-            "items": [_summary_response(record) for record in records],
-            "next_cursor": None,
+            "items": [_summary_response(record) for record in page],
+            "next_cursor": encode_transfer_cursor(page[-1]) if has_more and page else None,
         }
 
     @router.get("/v1/transfers/{transfer_id}", name="get_transfer")
@@ -266,9 +271,13 @@ def create_router() -> APIRouter:
         principal: Principal = Depends(require_scope("transfer:reconcile")),
         body: dict[str, Any] = Depends(_required_json_body),
     ) -> dict[str, Any]:
-        _parse_model(_ReconcileRequest, body)
+        evidence = _parse_model(ReconciliationEvidence, body)
         try:
-            record = await _worker(request).reconcile_transfer(principal.tenant_id, transfer_id)
+            record = await _worker(request).reconcile_transfer(
+                principal.tenant_id,
+                transfer_id,
+                evidence=evidence,
+            )
         except Exception as exc:
             raise _api_error_from_exception(exc) from exc
         return _detail_response(request, record)
@@ -348,8 +357,13 @@ def create_router() -> APIRouter:
         principal: Principal = Depends(require_scope("connector:admin")),
         body: dict[str, Any] = Depends(_required_json_body),
     ) -> JSONResponse:
-        definition = _parse_model(ConnectorDefinition, body)
         try:
+            public_definition = _parse_model(ConnectorCreateRequest, body)
+            definition = await _translate_connector_definition(
+                request,
+                principal.tenant_id,
+                public_definition,
+            )
             await _registry(request).register(principal.tenant_id, definition)
             stored = await _store(request).get_connector(
                 principal.tenant_id,
@@ -369,7 +383,13 @@ def create_router() -> APIRouter:
         principal: Principal = Depends(require_scope("connector:admin")),
         body: dict[str, Any] = Depends(_optional_json_body),
     ) -> dict[str, Any]:
-        _parse_model(_ConnectorValidationRequest, body)
+        validation_request = _parse_model(_ConnectorValidationRequest, body)
+        if validation_request.mode in {"dry-run-write", "sandbox-write"} or validation_request.write_validation:
+            raise ApiError(
+                422,
+                "WRITE_VALIDATION_UNSUPPORTED",
+                "write validation is not supported by this connector",
+            )
         connector: Connector | None = None
         try:
             connector = await _registry(request).get(principal.tenant_id, connector_id)
@@ -533,14 +553,7 @@ async def _optional_json_body(request: Request) -> dict[str, Any]:
 
 
 async def _read_json_body(request: Request, *, required: bool) -> dict[str, Any]:
-    raw = await request.body()
-    if not raw and not required:
-        return {}
-    if not raw:
-        raise ApiError(400, "INVALID_JSON", "request body is required")
     content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-    if content_type != "application/json":
-        raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json")
     max_bytes = int(getattr(request.app.state.settings, "max_payload_bytes"))
     content_length = request.headers.get("Content-Length")
     if content_length is not None:
@@ -549,8 +562,25 @@ async def _read_json_body(request: Request, *, required: bool) -> dict[str, Any]
                 raise ApiError(413, "PAYLOAD_TOO_LARGE", "request payload exceeds the configured limit")
         except ValueError:
             pass
-    if len(raw) > max_bytes:
-        raise ApiError(413, "PAYLOAD_TOO_LARGE", "request payload exceeds the configured limit")
+    if content_length == "0" and not required:
+        return {}
+    if content_type != "application/json" and (required or content_length is not None):
+        raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json")
+
+    chunks: list[bytes] = []
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise ApiError(413, "PAYLOAD_TOO_LARGE", "request payload exceeds the configured limit")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    if not raw and not required:
+        return {}
+    if content_type != "application/json":
+        raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json")
+    if not raw:
+        raise ApiError(400, "INVALID_JSON", "request body is required")
     try:
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -584,8 +614,7 @@ def _check_rate_limit(request: Request, principal: Principal) -> None:
     limiter = getattr(request.app.state, "rate_limiter", None)
     if limiter is None:
         return
-    client_id = request.headers.get("X-Client-ID") or principal.subject
-    decision: RateLimitDecision = limiter.check(principal.tenant_id, client_id)
+    decision: RateLimitDecision = limiter.check(principal.tenant_id, principal.subject)
     if not decision.allowed:
         raise ApiError(
             429,
@@ -635,6 +664,73 @@ async def _resolve_transfer_dependencies(
     finally:
         await _close_connector(connector_instance)
     return connector, mapping
+
+
+_OPERATION_BINDINGS_EXTENSION = "x-openapi-to-mcp-operation-bindings"
+
+
+async def _translate_connector_definition(
+    request: Request,
+    tenant_id: str,
+    public_definition: ConnectorCreateRequest,
+) -> ConnectorDefinition:
+    store = _store(request)
+    existing = await store.get_connector(tenant_id, public_definition.connector_id)
+    if public_definition.spec is not None:
+        spec = deepcopy(public_definition.spec)
+        operation_bindings = _resolve_public_operation_bindings(spec)
+        spec_ref = f"object://openapi/{public_spec_hash(spec)}"
+    else:
+        if existing is None or existing.spec_ref != public_definition.spec_ref:
+            raise ApiError(
+                422,
+                "SPEC_SNAPSHOT_UNRESOLVED",
+                "the referenced OpenAPI snapshot could not be resolved",
+            )
+        spec = deepcopy(existing.spec)
+        operation_bindings = existing.operation_bindings
+        spec_ref = existing.spec_ref
+
+    return ConnectorDefinition(
+        connector_id=public_definition.connector_id,
+        version=(existing.version + 1) if existing is not None else 1,
+        type=public_definition.type,
+        display_name=public_definition.display_name,
+        base_url=public_definition.base_url,
+        spec_ref=spec_ref,
+        spec=spec,
+        credential_ref=public_definition.credential_ref,
+        additional_headers=public_definition.additional_headers,
+        operation_bindings=operation_bindings,
+        policy=public_definition.policy,
+    )
+
+
+def _resolve_public_operation_bindings(spec: dict[str, Any]) -> dict[str, OperationBinding]:
+    raw_bindings = spec.get(_OPERATION_BINDINGS_EXTENSION)
+    if not isinstance(raw_bindings, dict) or not raw_bindings:
+        raise ApiError(
+            422,
+            "OPERATION_BINDINGS_UNRESOLVED",
+            "inline OpenAPI specs must declare operation bindings",
+        )
+    bindings: dict[str, OperationBinding] = {}
+    for operation_name, raw_binding in raw_bindings.items():
+        if operation_name not in {"create", "update", "upsert"} or not isinstance(raw_binding, dict):
+            raise ApiError(
+                422,
+                "OPERATION_BINDINGS_INVALID",
+                "inline OpenAPI operation bindings are invalid",
+            )
+        try:
+            bindings[operation_name] = OperationBinding.model_validate(raw_binding)
+        except ValidationError as exc:
+            raise ApiError(
+                422,
+                "OPERATION_BINDINGS_INVALID",
+                "inline OpenAPI operation bindings are invalid",
+            ) from exc
+    return bindings
 
 
 async def _load_connector_operation(
@@ -885,6 +981,12 @@ def _safe_exception_detail(code: str) -> str:
         "OPERATION_UNBOUND": "operation is not bound by the connector",
         "DEDUPLICATION_KEY_MISMATCH": "deduplication key path does not match the mapping",
         "TARGET_SCHEMA_UNRESOLVED": "mapping target schema could not be resolved",
+        "CURSOR_INVALID": "cursor is invalid",
+        "SPEC_SNAPSHOT_UNRESOLVED": "the referenced OpenAPI snapshot could not be resolved",
+        "OPERATION_BINDINGS_UNRESOLVED": "inline OpenAPI specs must declare operation bindings",
+        "OPERATION_BINDINGS_INVALID": "inline OpenAPI operation bindings are invalid",
+        "WRITE_VALIDATION_UNSUPPORTED": "write validation is not supported by this connector",
+        "TARGET_RESOURCE_ID_REQUIRED": "confirmed_present requires a target resource id",
     }
     return details.get(code, "request or mapping validation failed")
 

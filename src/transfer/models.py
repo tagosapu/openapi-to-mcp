@@ -18,7 +18,7 @@ UnitIntervalFloat = Annotated[float, Field(ge=0.0, le=1.0)]
 
 
 def _ensure_non_http_reference(value: str, field_name: str) -> str:
-    if value.split("://", 1)[0].lower() in {"http", "https"}:
+    if value.split(":", 1)[0].lower() in {"http", "https"}:
         raise ValueError(f"{field_name} must use a non-http reference URI")
     return value
 
@@ -236,6 +236,35 @@ class OperationBinding(TransferBaseModel):
     conflict_policy: Literal["reconcile", "fail"] = "reconcile"
 
 
+class ConnectorCreateRequest(TransferBaseModel):
+    connector_id: str = Field(min_length=1)
+    type: Literal["rest-openapi"]
+    display_name: str = Field(min_length=1)
+    base_url: AnyHttpUrl
+    spec_ref: str | None = Field(default=None, min_length=1)
+    spec: dict[str, Any] | None = None
+    credential_ref: ReferenceUri
+    additional_headers: list[AdditionalHeader]
+    policy: ConnectorPolicy
+
+    @model_validator(mode="after")
+    def validate_public_spec(self) -> ConnectorCreateRequest:
+        if (self.spec is None) == (self.spec_ref is None):
+            raise ValueError("exactly one of spec or spec_ref is required")
+        if self.spec is not None and not {"openapi", "info", "paths"}.issubset(self.spec):
+            raise ValueError("spec must contain openapi, info, and paths")
+        if self.spec_ref is not None:
+            _ensure_non_http_reference(self.spec_ref, "spec_ref")
+        _ensure_non_http_reference(self.credential_ref, "credential_ref")
+        return self
+
+
+class ReconciliationEvidence(TransferBaseModel):
+    resolution: Literal["confirmed_present", "confirmed_absent", "unresolved"]
+    target_resource_id: str | None = Field(default=None, min_length=1, max_length=512)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
 class OperationSelection(TransferBaseModel):
     name: Literal["create", "update", "upsert"]
     operation_id: str
@@ -342,6 +371,8 @@ class TransferFilters(TransferBaseModel):
     correlation_id: str | None = None
     cursor: str | None = None
     limit: int = Field(default=50, ge=1, le=200)
+    created_after: datetime | None = None
+    created_before: datetime | None = None
 
 
 class CreateTransferResult(TransferBaseModel):

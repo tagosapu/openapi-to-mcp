@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from collections.abc import Iterable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -137,6 +138,10 @@ class TransferStore(Protocol):
     async def get_transfer(self, tenant_id: str, transfer_id: str) -> TransferRecord | None: ...
 
     async def list_transfers(self, tenant_id: str, filters: TransferFilters) -> list[TransferRecord]: ...
+
+    async def record_reconciliation_evidence(
+        self, tenant_id: str, transfer_id: str, detail: dict[str, Any]
+    ) -> TransferRecord: ...
 
     async def claim_due_transfer(self, now: datetime) -> ClaimedTransfer | None: ...
 
@@ -690,12 +695,63 @@ class SqliteTransferStore:
         if filters.correlation_id is not None:
             query.append("AND correlation_id = ?")
             params.append(filters.correlation_id)
+        if filters.created_after is not None:
+            query.append("AND created_at > ?")
+            params.append(_isoformat(filters.created_after))
+        if filters.created_before is not None:
+            query.append("AND created_at < ?")
+            params.append(_isoformat(filters.created_before))
+        if filters.cursor is not None:
+            cursor_created_at, cursor_transfer_id = decode_transfer_cursor(filters.cursor)
+            query.append(
+                "AND (created_at < ? OR (created_at = ? AND transfer_id < ?))"
+            )
+            params.extend(
+                [
+                    _isoformat(cursor_created_at),
+                    _isoformat(cursor_created_at),
+                    cursor_transfer_id,
+                ]
+            )
         query.append("ORDER BY created_at DESC, transfer_id DESC LIMIT ?")
-        params.append(filters.limit)
+        params.append(filters.limit + 1)
         cursor = await connection.execute(" ".join(query), tuple(params))
         rows = await cursor.fetchall()
         await cursor.close()
         return [self._transfer_from_row(row) for row in rows]
+
+    async def record_reconciliation_evidence(
+        self, tenant_id: str, transfer_id: str, detail: dict[str, Any]
+    ) -> TransferRecord:
+        connection = self._require_connection()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = await self._get_transfer_row_any_tenant(connection, transfer_id)
+            if row is None:
+                raise NotFoundError("transfer not found")
+            if row["tenant_id"] != tenant_id:
+                raise TenantIsolationError("transfer belongs to another tenant")
+            if TransferStatus(row["status"]) != TransferStatus.RECONCILIATION_REQUIRED:
+                raise InvalidTransitionError("reconciliation evidence requires reconciliation_required status")
+            now = _utc_now()
+            await self._append_event(
+                connection,
+                tenant_id=tenant_id,
+                transfer_id=transfer_id,
+                from_status=TransferStatus.RECONCILIATION_REQUIRED,
+                to_status=TransferStatus.RECONCILIATION_REQUIRED,
+                event_type="reconciliation_evidence",
+                detail=_safe_reconciliation_detail(detail),
+                created_at=now,
+            )
+            refreshed = await self.get_transfer(tenant_id, transfer_id)
+            if refreshed is None:
+                raise NotFoundError("transfer disappeared during reconciliation evidence")
+            await connection.commit()
+            return refreshed
+        except Exception:
+            await connection.rollback()
+            raise
 
     async def claim_due_transfer(self, now: datetime) -> ClaimedTransfer | None:
         connection = self._require_connection()
@@ -1474,6 +1530,46 @@ def _json_dumps(value: Any) -> str:
 
 def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def encode_transfer_cursor(record: TransferRecord) -> str:
+    payload = {
+        "v": 1,
+        "created_at": _isoformat(record.created_at),
+        "transfer_id": record.transfer_id,
+    }
+    encoded = base64.urlsafe_b64encode(_json_dumps(payload).encode("utf-8"))
+    return encoded.rstrip(b"=").decode("ascii")
+
+
+def decode_transfer_cursor(cursor: str) -> tuple[datetime, str]:
+    if not cursor or len(cursor) > 512:
+        raise ValueError("CURSOR_INVALID")
+    try:
+        encoded = cursor.encode("ascii")
+        padded = encoded + b"=" * (-len(encoded) % 4)
+        payload = json.loads(
+            base64.b64decode(padded, altchars=b"-_", validate=True).decode("utf-8")
+        )
+        if not isinstance(payload, dict) or payload.get("v") != 1:
+            raise ValueError
+        created_at = _parse_datetime(payload.get("created_at"))
+        transfer_id = payload.get("transfer_id")
+        if (
+            created_at is None
+            or created_at.tzinfo is None
+            or not isinstance(transfer_id, str)
+            or not transfer_id
+        ):
+            raise ValueError
+        return created_at, transfer_id
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, binascii.Error) as exc:
+        raise ValueError("CURSOR_INVALID") from exc
+
+
+def _safe_reconciliation_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"resolution", "target_resource_id", "notes_present", "notes_sha256"}
+    return {key: detail[key] for key in allowed if key in detail}
 
 
 def _normalize_connector_payload(value: dict[str, Any]) -> dict[str, Any]:

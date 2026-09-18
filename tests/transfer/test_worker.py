@@ -24,6 +24,7 @@ from src.transfer.models import (
     MappingIssue,
     OperationSelection,
     OutboundRequestParts,
+    ReconciliationEvidence,
     TransferRequest,
     TransferResult,
     TransferStatus,
@@ -1192,3 +1193,71 @@ async def test_worker_reconcile_transfer_updates_same_record(
 
     assert record.transfer_id == transfer_id
     assert record.status == expected_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("evidence", "expected_status", "expected_target"),
+    [
+        (
+            ReconciliationEvidence(
+                resolution="confirmed_present",
+                target_resource_id="target-operator",
+                notes="verified by operator",
+            ),
+            TransferStatus.SUCCEEDED,
+            "target-operator",
+        ),
+        (
+            ReconciliationEvidence(resolution="confirmed_absent"),
+            TransferStatus.QUEUED,
+            None,
+        ),
+        (
+            ReconciliationEvidence(resolution="unresolved", notes="needs another check"),
+            TransferStatus.RECONCILIATION_REQUIRED,
+            None,
+        ),
+    ],
+)
+async def test_worker_records_operator_reconciliation_evidence(
+    store,
+    evidence: ReconciliationEvidence,
+    expected_status: TransferStatus,
+    expected_target: str | None,
+) -> None:
+    await _save_prereqs(store)
+    connector = FakeConnector(
+        reconcile_result=ReconciliationResult(state="unknown"),
+    )
+    registry = FakeRegistry({("tenant-a", "connector-test", 7): connector})
+    worker = TransferWorker(store, registry, MappingEngine(), RetryPolicy(jitter_ratio=0.0))
+    transfer_id = await _seed_transfer(
+        store,
+        suffix=f"operator-{evidence.resolution}",
+        status=TransferStatus.RECONCILIATION_REQUIRED,
+    )
+
+    record = await worker.reconcile_transfer("tenant-a", transfer_id, evidence=evidence)
+
+    assert record.status == expected_status
+    assert (record.result.target_resource_id if record.result else None) == expected_target
+    assert connector.reconcile_contexts == []
+    if evidence.resolution == "unresolved":
+        connection = store._require_connection()
+        cursor = await connection.execute(
+            """
+            SELECT detail_json FROM transfer_events
+            WHERE transfer_id = ? AND event_type = 'reconciliation_evidence'
+            ORDER BY event_order DESC
+            LIMIT 1
+            """,
+            (transfer_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        assert row is not None
+        detail = json.loads(row["detail_json"])
+        assert detail["resolution"] == "unresolved"
+        assert detail["notes_present"] is True
+        assert "needs another check" not in row["detail_json"]

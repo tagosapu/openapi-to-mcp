@@ -62,6 +62,7 @@ class JwtAuthorizer:
             audience=self._settings.jwt_audience,
             issuer=self._settings.jwt_issuer,
             algorithms=[signing_key.algorithm_name],
+            options={"require": ["exp", "iss", "aud", "sub", "tenant_id"]},
         )
         scopes = claims.get("scope", "")
         return Principal(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import random
 from typing import Any, Literal
@@ -19,6 +20,7 @@ from .models import (
     MappingIssue,
     OperationSelection,
     ProblemDetail,
+    ReconciliationEvidence,
     TransferRecord,
     TransferRequest,
     TransferResult,
@@ -216,10 +218,18 @@ class TransferWorker:
             clear_completed_at=True,
         )
 
-    async def reconcile_transfer(self, tenant_id: str, transfer_id: str) -> TransferRecord:
+    async def reconcile_transfer(
+        self,
+        tenant_id: str,
+        transfer_id: str,
+        evidence: ReconciliationEvidence | None = None,
+    ) -> TransferRecord:
         record = await self._require_record(tenant_id, transfer_id)
         if record.status != TransferStatus.RECONCILIATION_REQUIRED:
             raise InvalidTransitionError("reconcile requires reconciliation_required status")
+
+        if evidence is not None:
+            return await self._apply_reconciliation_evidence(record, evidence)
 
         loaded = await self._load_context(record)
         try:
@@ -261,6 +271,43 @@ class TransferWorker:
                 {"reason": "manual reconciliation"},
             )
         return record
+
+    async def _apply_reconciliation_evidence(
+        self, record: TransferRecord, evidence: ReconciliationEvidence
+    ) -> TransferRecord:
+        detail = _reconciliation_event_detail(evidence)
+        if evidence.resolution == "confirmed_present":
+            if evidence.target_resource_id is None or not evidence.target_resource_id.strip():
+                raise MappingValidationError("TARGET_RESOURCE_ID_REQUIRED")
+            transfer_result = (record.result or TransferResult()).model_copy(deep=True)
+            transfer_result.target_resource_id = evidence.target_resource_id
+            transfer_result.postcondition_verified = True
+            transfer_result.completed_at = _utc_now()
+            return await self._store.transition_state(
+                record.tenant_id,
+                record.transfer_id,
+                TransferStatus.RECONCILIATION_REQUIRED,
+                TransferStatus.SUCCEEDED,
+                detail,
+                result=transfer_result,
+                clear_error=True,
+            )
+        if evidence.resolution == "confirmed_absent":
+            return await self._store.transition_state(
+                record.tenant_id,
+                record.transfer_id,
+                TransferStatus.RECONCILIATION_REQUIRED,
+                TransferStatus.QUEUED,
+                detail,
+                clear_result=True,
+                clear_error=True,
+                clear_completed_at=True,
+            )
+        return await self._store.record_reconciliation_evidence(
+            record.tenant_id,
+            record.transfer_id,
+            detail,
+        )
 
     async def _run_loop(self) -> None:
         await self.recover_inflight()
@@ -928,6 +975,17 @@ def _delivery_event_detail(
         "duration_ms": duration_ms,
         "request_id": request_id,
     }
+
+
+def _reconciliation_event_detail(evidence: ReconciliationEvidence) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "resolution": evidence.resolution,
+        "target_resource_id": evidence.target_resource_id,
+        "notes_present": evidence.notes is not None,
+    }
+    if evidence.notes is not None:
+        detail["notes_sha256"] = hashlib.sha256(evidence.notes.encode("utf-8")).hexdigest()
+    return detail
 
 
 def _validated_target_resource_id(result: TransferResult) -> str:
