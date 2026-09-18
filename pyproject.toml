@@ -42,6 +42,7 @@ dependencies = [
 
 [project.scripts]
 openapi-to-mcp = "src.cli:cli_main"
+ocr-transfer-api = "src.transfer.app:main"
 
 [project.optional-dependencies]
 dev = [
