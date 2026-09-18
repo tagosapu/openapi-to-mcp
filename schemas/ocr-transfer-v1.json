@@ -35,7 +35,7 @@
     },
     "opaqueRef": {
       "type": "string",
-      "pattern": "^(?!https?://)[a-z][a-z0-9+.-]*://[A-Za-z0-9._~!$&'()*+,;=:@%/-]+$"
+      "pattern": "^object://[A-Za-z0-9._-]+(?:/[A-Za-z0-9._~!$&'()*+,;=:@%-]+)+$"
     },
     "bbox": {
       "type": "array",
@@ -332,10 +332,6 @@
     "ocr": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "fields",
-        "line_items"
-      ],
       "properties": {
         "languages": {
           "type": "array",
@@ -371,7 +367,19 @@
             }
           }
         }
-      }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "fields"
+          ]
+        },
+        {
+          "required": [
+            "line_items"
+          ]
+        }
+      ]
     },
     "delivery": {
       "type": "object",
@@ -396,8 +404,7 @@
           "enum": [
             "create",
             "update",
-            "upsert",
-            "batch_upsert"
+            "upsert"
           ]
         },
         "deduplication_key_path": {

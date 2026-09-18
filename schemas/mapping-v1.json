@@ -51,8 +51,7 @@
         "enum": [
           "create",
           "update",
-          "upsert",
-          "batch_upsert"
+          "upsert"
         ]
       }
     },

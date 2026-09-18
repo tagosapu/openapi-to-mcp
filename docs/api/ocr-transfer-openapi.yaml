@@ -513,6 +513,12 @@ components:
       $ref: ../../schemas/ocr-transfer-v1.json
     MappingDefinition:
       $ref: ../../schemas/mapping-v1.json
+    TransferOperation:
+      type: string
+      enum:
+        - create
+        - update
+        - upsert
     TransferStatus:
       type: string
       enum:
@@ -786,12 +792,7 @@ components:
         connector_id:
           type: string
         operation:
-          type: string
-          enum:
-            - create
-            - update
-            - upsert
-            - batch_upsert
+          $ref: '#/components/schemas/TransferOperation'
         deduplication_key_path:
           type: string
           pattern: ^(?:|/(?:[^/~]|~0|~1)*)+$
@@ -914,23 +915,15 @@ components:
           additionalProperties: false
           required:
             - name
+            - value_ref
           properties:
             name:
               type: string
-              minLength: 1
-            value:
-              type: string
-              minLength: 1
+              enum:
+                - X-Api-Version
             value_ref:
               type: string
               pattern: ^(?!https?://)[a-z][a-z0-9+.-]*://[A-Za-z0-9._~!$&'()*+,;=:@%/-]+$
-          oneOf:
-            - required: [value]
-              not:
-                required: [value_ref]
-            - required: [value_ref]
-              not:
-                required: [value]
         policy:
           type: object
           additionalProperties: false
@@ -1051,7 +1044,7 @@ components:
         operations:
           type: array
           items:
-            type: string
+            $ref: '#/components/schemas/TransferOperation'
     MappingRegistered:
       allOf:
         - $ref: '#/components/schemas/MappingListItem'

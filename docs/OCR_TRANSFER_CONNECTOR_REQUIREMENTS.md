@@ -224,7 +224,7 @@ flowchart LR
 - `value_type` は `string`、`integer`、`number`、`boolean`、`date`、`datetime`、`currency`、`object`、`array` のいずれかとする。
 - `date` は `YYYY-MM-DD`、`datetime` はRFC 3339、`currency` は数値の `value` とISO 4217の `unit` を組み合わせる。
 - `bbox` はページ左上を原点とする相対座標 `[x_min, y_min, x_max, y_max]` とし、各値を `0.0` 以上 `1.0` 以下とする。ピクセル座標が必要な場合は別フィールドで表現する。
-- `storage_ref` と `text_ref` は任意URLではなく、サーバーが許可したストレージ参照の不透明な識別子とする。サーバーはリクエストごとに外部URLを取得しない。
+- `storage_ref` と `text_ref` は任意URLではなく、`object://<namespace>/<opaque-id>` 形式のサーバー許可済みストレージ参照だけを受け付ける。`file://` や `ftp://` などの外部取得を伴う形式は許可しない。
 - `schema_version` が未対応の場合は受付を拒否し、対応するバージョンをエラーに含める。
 - `document.document_id` の一意性は、認可コンテキストの `tenant_id` と `document.source_system` の組み合わせで評価する。
 
@@ -336,7 +336,7 @@ flowchart LR
 コネクタ、マッピング、認証情報参照、再試行ポリシーは管理プレーンで管理する。
 
 - `GET /v1/connectors`: 利用可能なコネクタのメタデータと機能だけを返し、`connector:read` を要求する。
-- `POST /v1/connectors`: `connector_id`、`type=rest-openapi`、`display_name`、絶対 `base_url`、固定済みの `spec` または `spec_ref`、`credential_ref`、許可済み `additional_headers`、タイムアウトポリシーを受け付け、`connector:admin` を要求する。秘密情報の実値は受け付けず、`credential_ref` の存在だけを検証する。
+- `POST /v1/connectors`: `connector_id`、`type=rest-openapi`、`display_name`、絶対 `base_url`、固定済みの `spec` または `spec_ref`、`credential_ref`、許可済み `additional_headers`、タイムアウトポリシーを受け付け、`connector:admin` を要求する。秘密情報の実値は受け付けず、`credential_ref` の存在だけを検証する。MVPの公開契約では `additional_headers` に秘密値の直書きを許可せず、明示的に承認した非秘密ヘッダーの設定参照だけを受け付ける。
 - `POST /v1/connectors/{connector_id}/validate`: OpenAPI契約、base URL、operation単位の認証、パラメータ型、代表的なレスポンスを検証し、`connector:admin` を要求する。書き込み検証はサンドボックスまたはドライランを明示した場合だけ許可する。
 - `GET /v1/mappings`: マッピングのID、対象文書種別、バージョン、状態を返し、`mapping:read` を要求する。
 - `POST /v1/mappings`: `mapping_id`、`version`、`connector_id`、`document_types`、`operations`、`deduplication_key_path`、`target_schema_ref`、`rules` を受け付け、`mapping:write` を要求する。`target_schema_ref` は登録済みOpenAPIスナップショット内のローカル参照 `openapi:#/<json-pointer>` を使い、後続のOpenAPI事前検証がそのスナップショットに対して解決する。
@@ -470,7 +470,7 @@ cancellation_requested -> succeeded | failed | reconciliation_required | cancell
 
 公開のコネクタ登録リクエストは `display_name` を保持し、`spec` または `spec_ref` の一方だけを受け付ける。後続の内部保存では、解決済みの仕様スナップショットやバージョン識別子を別途保持してよいが、公開契約では両方を同時必須にしない。
 
-`base_url` は絶対URLで、登録済みの許可リストに含める。`additional_headers` は認証ヘッダーやHTTP制御ヘッダーを除く非秘密の固定ヘッダー、または許可された設定参照だけを扱う。コネクタ登録時に、仕様の `servers`、認証方式、operation単位の `security`、必須ヘッダーとの整合を検証する。
+`base_url` は絶対URLで、登録済みの許可リストに含める。`additional_headers` は認証ヘッダーやHTTP制御ヘッダーを除く非秘密の固定ヘッダー、または許可された設定参照だけを扱う。MVPの公開契約で受け付ける追加ヘッダー名は `X-Api-Version` に限定し、値は `value_ref` による設定参照でのみ指定する。コネクタ登録時に、仕様の `servers`、認証方式、operation単位の `security`、必須ヘッダーとの整合を検証する。
 
 ### 10.2 標準コネクタインターフェース
 
@@ -511,9 +511,10 @@ reconcile(transfer_context, credential_ref) -> reconciliation_result
 | `create` | 転記先に新規リソースを作成する |
 | `update` | 転記先IDまたは一意な検索キーで既存リソースを更新する。対象なしの扱いを設定する |
 | `upsert` | 検索キーで既存を確認し、存在すれば更新、なければ作成する |
-| `batch_upsert` | 拡張仕様。複数データをまとめてアップサートし、部分成功に対応する |
 
 `upsert` は転記先にネイティブ機能がある場合はそれを優先する。検索してから作成する場合は、同じキーの同時実行を検知できる仕組み、409時の再照会、外部IDの保存を必須とする。更新対象なし、複数件一致、作成競合の扱いをコネクタ設定で明示する。削除は初期仕様に含めない。
+
+`batch_upsert` は将来の拡張仕様として予約してよいが、MVPの公開契約と操作enumには含めない。
 
 ## 11. 認証・認可
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,16 @@ def load_json(path: str) -> dict[str, Any]:
 
 def load_yaml(path: str) -> dict[str, Any]:
     return yaml.safe_load((REPO_ROOT / path).read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def json_loader() -> Callable[[str], dict[str, Any]]:
+    return load_json
+
+
+@pytest.fixture
+def yaml_loader() -> Callable[[str], dict[str, Any]]:
+    return load_yaml
 
 
 @pytest.fixture
