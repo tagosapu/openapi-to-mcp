@@ -1,4 +1,6 @@
 import json
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -213,6 +215,94 @@ async def test_chunk_retries_transient_provider_failure() -> None:
     assert fake_client.calls == 2
     sleep.assert_awaited_once()
     assert evaluation.llm_calls_count == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_chunk_result_is_reused_from_workspace_cache() -> None:
+    class FakeLLMClient:
+        provider = "azure"
+        model = "azure/test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_text(self, request):
+            self.calls += 1
+            return LLMResponse(
+                text=json.dumps(
+                    {
+                        "operations": [],
+                        "schemas": [],
+                        "security_schemes": [],
+                        "overall": {
+                            "overall_quality": "good",
+                            "completeness_score": 4,
+                            "ai_readiness_score": 4,
+                        },
+                    }
+                ),
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                model=self.model,
+            )
+
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "Cached Example", "version": "1.0.0"},
+        "paths": {"/health": {"get": {"responses": {"200": {"description": "ok"}}}}},
+    }
+    cache_dir = Path("results/runtime/test_chunk_cache")
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    fake_client = FakeLLMClient()
+    enhancer = OpenAPIEnhancer.__new__(OpenAPIEnhancer)
+    enhancer.llm_client = fake_client
+    enhancer.enable_chunk_cache = True
+    enhancer.evaluation_template = Template("{{ openapi_spec }}")
+    enhancer.chunk_evaluation_template = Template("{{ openapi_spec }}")
+    request = EnhancementRequest(
+        spec_content=json.dumps(spec), spec_format="json", original_filename="cached.json"
+    )
+    linting_results = LintingResult(
+        total_issues=0, linting_score=5, linting_summary="clean"
+    )
+
+    def get_int(key, default):
+        return {
+            "azure_chunk_prompt_tokens": 2_140,
+            "azure_chunk_prompt_overhead_tokens": 2_000,
+            "azure_chunk_max_tokens": 100,
+            "azure_max_concurrency": 1,
+        }.get(key, default)
+
+    try:
+        with (
+            patch("src.services.openapi_enhancer.config.get_int", side_effect=get_int),
+            patch(
+                "src.services.openapi_enhancer.config.get_str",
+                return_value=str(cache_dir),
+            ),
+        ):
+            first = await enhancer._evaluate_large_specification(
+                spec_dict=spec,
+                metadata={"api_title": "Cached Example", "api_version": "1.0.0"},
+                request=request,
+                linting_results=linting_results,
+                max_tokens=100,
+                temperature=0.1,
+            )
+            second = await enhancer._evaluate_large_specification(
+                spec_dict=spec,
+                metadata={"api_title": "Cached Example", "api_version": "1.0.0"},
+                request=request,
+                linting_results=linting_results,
+                max_tokens=100,
+                temperature=0.1,
+            )
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+    assert fake_client.calls == 1
+    assert first.llm_calls_count == 1
+    assert second.llm_calls_count == 0
 
 
 @pytest.mark.asyncio

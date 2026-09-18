@@ -4,11 +4,13 @@ Uses Amazon Bedrock with Anthropic Claude to analyze specs and provide enhanceme
 """
 
 import asyncio
+import hashlib
 import json
 import random
 import uuid
 import yaml
 import logging
+from pathlib import Path
 from jinja2 import Template
 from datetime import datetime
 from .config_loader import config
@@ -31,6 +33,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+CHUNK_CACHE_VERSION = "chunk-evaluation-v1"
 
 
 class OpenAPILinter:
@@ -740,6 +744,9 @@ class OpenAPIEnhancer:
             )
             self.evaluation_template = self._load_evaluation_template()
             self.chunk_evaluation_template = self._load_chunk_evaluation_template()
+            self.enable_chunk_cache = config.get_bool(
+                "azure_chunk_cache_enabled", True
+            )
             self.linter = OpenAPILinter()
             logger.info("Initialized OpenAPI enhancer with linting support")
         except Exception as e:
@@ -894,6 +901,8 @@ class OpenAPIEnhancer:
         max_concurrency = max(
             1, config.get_int("azure_max_concurrency", 3)
         )
+        cache_dir = self._get_chunk_cache_dir()
+        spec_hash = self._hash_json(spec_dict)
         semaphore = asyncio.Semaphore(max_concurrency)
 
         logger.info(
@@ -941,6 +950,14 @@ class OpenAPIEnhancer:
                     len(chunk.schema_names),
                     chunk.estimated_tokens,
                 )
+                cache_key = self._chunk_cache_key(spec_hash, chunk)
+                if cache_dir:
+                    cached_result = self._load_cached_chunk(
+                        cache_dir, cache_key, chunk.index, len(chunks)
+                    )
+                    if cached_result:
+                        return cached_result
+
                 llm_request = LLMRequest(
                     prompt=chunk_prompt,
                     max_tokens=chunk_max_tokens,
@@ -970,9 +987,17 @@ class OpenAPIEnhancer:
                 else:
                     raise RuntimeError("Chunk evaluation did not produce a response")
 
-                return self._parse_evaluation_response(response.text), self._usage_info(
-                    response
-                )
+                evaluation_data = self._parse_evaluation_response(response.text)
+                usage_info = self._usage_info(response)
+                if cache_dir:
+                    self._save_cached_chunk(
+                        cache_dir,
+                        cache_key,
+                        chunk.index,
+                        evaluation_data,
+                        usage_info,
+                    )
+                return evaluation_data, usage_info
 
         chunk_results = await asyncio.gather(*(evaluate_chunk(chunk) for chunk in chunks))
         evaluation_data = self._merge_chunk_evaluations(
@@ -1033,6 +1058,91 @@ class OpenAPIEnhancer:
             "ReadError",
             "TimeoutException",
         }
+
+    def _get_chunk_cache_dir(self) -> Optional[Path]:
+        """Return the workspace-relative chunk cache directory when enabled."""
+        if not getattr(self, "enable_chunk_cache", False):
+            return None
+        cache_dir_value = config.get_str("azure_chunk_cache_dir", "")
+        if not cache_dir_value:
+            return None
+        cache_dir = Path(cache_dir_value)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    @staticmethod
+    def _hash_json(value: Any) -> str:
+        serialized = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _chunk_cache_key(self, spec_hash: str, chunk: OpenAPIChunk) -> str:
+        chunk_hash = self._hash_json(chunk.spec)
+        cache_identity = "|".join(
+            (
+                CHUNK_CACHE_VERSION,
+                self.llm_client.model,
+                spec_hash,
+                str(chunk.index),
+                chunk_hash,
+            )
+        )
+        return hashlib.sha256(cache_identity.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _load_cached_chunk(
+        cache_dir: Path, cache_key: str, chunk_index: int, chunk_count: int
+    ) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
+        cache_path = cache_dir / f"chunk_{cache_key}.json"
+        if not cache_path.exists():
+            return None
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("cache_version") != CHUNK_CACHE_VERSION:
+                return None
+            evaluation = cached.get("evaluation")
+            if not isinstance(evaluation, dict):
+                return None
+            logger.info(
+                "Using cached chunk %d/%d from %s",
+                chunk_index + 1,
+                chunk_count,
+                cache_path,
+            )
+            return evaluation, {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "tokens": 0,
+                "cost": 0.0,
+                "calls": 0,
+            }
+        except (OSError, TypeError, ValueError) as error:
+            logger.warning("Ignoring invalid chunk cache %s: %s", cache_path, error)
+            return None
+
+    @staticmethod
+    def _save_cached_chunk(
+        cache_dir: Path,
+        cache_key: str,
+        chunk_index: int,
+        evaluation: Dict[str, Any],
+        usage_info: Dict[str, Any],
+    ) -> None:
+        cache_path = cache_dir / f"chunk_{cache_key}.json"
+        cache_payload = {
+            "cache_version": CHUNK_CACHE_VERSION,
+            "chunk_index": chunk_index,
+            "evaluation": evaluation,
+            "usage": usage_info,
+        }
+        try:
+            cache_path.write_text(
+                json.dumps(cache_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            logger.warning("Could not save chunk cache %s: %s", cache_path, error)
 
     @staticmethod
     def _parse_evaluation_response(response_text: str) -> Dict[str, Any]:

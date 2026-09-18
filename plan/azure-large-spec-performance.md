@@ -19,9 +19,11 @@ Azure OpenAI を使った通常サイズの評価性能を維持したまま、�
 - compact chunk prompt の最大実測入力は約 61,854 tokens で、64k の chunk 上限内だった。
 - 6 requests はすべて HTTP 200、`finish_reason=stop` で完了した。
 - 合計 usage は prompt 322,280 tokens、completion 16,479 tokens、total 338,759 tokens、約 0.951221 USD だった。
+- schema fallback を含む最終 CLI run も正常終了し、`results/azure/openapi/evaluation_20260918_121010.json` に 204 operations / 481 schemas を保存した。usage は prompt 322,280 tokens、completion 17,605 tokens、total 339,885 tokens、約 1.065167 USD だった。
 - LLM が返さなかった schema は元仕様から deterministic fallback を生成し、最終結果で 204 operations / 481 schemas を保持する。
 - LLM が 1-5 外の overall score を返した場合は reducer で 1-5 に clamp する。
 - chunk の 408、409、429、5xx、接続エラー、timeout は最大 2 回まで指数 backoff + jitter で再試行する。JSON/validation エラーは再試行しない。
+- 成功済み chunk は spec hash、model、chunk hash、prompt version を含む key で `results/.cache/` に保存し、同じ評価の再実行時に再利用する。cache hit は今回の API calls と usage に加算しない。
 
 ## 設計方針
 
@@ -98,6 +100,7 @@ azure_chunk_prompt_tokens: 64000
 azure_chunk_max_tokens: 16384
 azure_max_concurrency: 3
 azure_proxy_mode: auto
+azure_chunk_cache_enabled: true
 azure_chunk_retry_limit: 2
 azure_chunk_cache_dir: ./results/.cache
 ```

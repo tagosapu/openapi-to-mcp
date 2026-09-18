@@ -14,6 +14,8 @@ azure_chunk_prompt_overhead_tokens: 4000
 azure_chunk_max_tokens: 16384
 azure_chunk_retry_limit: 2
 azure_max_concurrency: 3
+azure_chunk_cache_enabled: true
+azure_chunk_cache_dir: ./results/.cache
 diagnostic_log_file: ./logs/aoai_run.log
 runtime_artifact_dir: ./results/runtime
 debug: false
