@@ -21,6 +21,7 @@ Azure OpenAI を使った通常サイズの評価性能を維持したまま、�
 - 合計 usage は prompt 322,280 tokens、completion 16,479 tokens、total 338,759 tokens、約 0.951221 USD だった。
 - LLM が返さなかった schema は元仕様から deterministic fallback を生成し、最終結果で 204 operations / 481 schemas を保持する。
 - LLM が 1-5 外の overall score を返した場合は reducer で 1-5 に clamp する。
+- chunk の 408、409、429、5xx、接続エラー、timeout は最大 2 回まで指数 backoff + jitter で再試行する。JSON/validation エラーは再試行しない。
 
 ## 設計方針
 
@@ -78,7 +79,7 @@ Azure OpenAI を使った通常サイズの評価性能を維持したまま、�
 1. チャンク評価用テンプレートを追加し、各チャンクが全体評価の JSON を要求しないようにする。
 2. `asyncio.Semaphore` で `azure_max_concurrency` を制限する。
 3. 推定 tokens を使った簡易 TPM/RPM レート制御を追加する。
-4. 429 は指数バックオフと jitter で再試行する。
+4. 408、409、429、5xx、接続エラー、timeout は指数バックオフと jitter で最大 2 回再試行する。JSON/validation エラーは再試行しない。
 5. connection reset、413、context limit は同じサイズで再送せず、チャンクを半分に縮小して再試行する。
 6. すべてのチャンク完了後、重複 schema を名前で統合し、operation の元順序を復元する。
 

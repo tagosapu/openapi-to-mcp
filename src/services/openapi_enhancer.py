@@ -5,6 +5,7 @@ Uses Amazon Bedrock with Anthropic Claude to analyze specs and provide enhanceme
 
 import asyncio
 import json
+import random
 import uuid
 import yaml
 import logging
@@ -889,6 +890,7 @@ class OpenAPIEnhancer:
             max_tokens,
             config.get_int("azure_chunk_max_tokens", 8_192),
         )
+        retry_limit = max(0, config.get_int("azure_chunk_retry_limit", 2))
         max_concurrency = max(
             1, config.get_int("azure_max_concurrency", 3)
         )
@@ -896,11 +898,12 @@ class OpenAPIEnhancer:
 
         logger.info(
             "Using chunked Azure evaluation: chunks=%d chunk_prompt_tokens=%d "
-            "chunk_max_tokens=%d max_concurrency=%d",
+            "chunk_max_tokens=%d max_concurrency=%d retry_limit=%d",
             len(chunks),
             chunk_prompt_tokens,
             chunk_max_tokens,
             max_concurrency,
+            retry_limit,
         )
 
         async def evaluate_chunk(
@@ -938,13 +941,35 @@ class OpenAPIEnhancer:
                     len(chunk.schema_names),
                     chunk.estimated_tokens,
                 )
-                response = await self.llm_client.generate_text(
-                    LLMRequest(
-                        prompt=chunk_prompt,
-                        max_tokens=chunk_max_tokens,
-                        temperature=temperature,
-                    )
+                llm_request = LLMRequest(
+                    prompt=chunk_prompt,
+                    max_tokens=chunk_max_tokens,
+                    temperature=temperature,
                 )
+                for attempt in range(retry_limit + 1):
+                    try:
+                        response = await self.llm_client.generate_text(llm_request)
+                        break
+                    except Exception as error:
+                        if (
+                            attempt >= retry_limit
+                            or not self._is_retryable_chunk_error(error)
+                        ):
+                            raise
+                        delay = min(30.0, 2**attempt) + random.uniform(0.0, 0.5)
+                        logger.warning(
+                            "Retrying chunk %d/%d after %s (attempt %d/%d) in %.2fs",
+                            chunk.index + 1,
+                            len(chunks),
+                            type(error).__name__,
+                            attempt + 1,
+                            retry_limit,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                else:
+                    raise RuntimeError("Chunk evaluation did not produce a response")
+
                 return self._parse_evaluation_response(response.text), self._usage_info(
                     response
                 )
@@ -994,6 +1019,20 @@ class OpenAPIEnhancer:
             usage_info["completion_tokens"],
         )
         return evaluation
+
+    @staticmethod
+    def _is_retryable_chunk_error(error: Exception) -> bool:
+        """Identify transient provider failures that are safe to retry."""
+        status_code = getattr(error, "status_code", None)
+        if status_code in {408, 409, 429, 500, 502, 503, 504}:
+            return True
+        return type(error).__name__ in {
+            "APIConnectionError",
+            "APITimeoutError",
+            "ConnectError",
+            "ReadError",
+            "TimeoutException",
+        }
 
     @staticmethod
     def _parse_evaluation_response(response_text: str) -> Dict[str, Any]:

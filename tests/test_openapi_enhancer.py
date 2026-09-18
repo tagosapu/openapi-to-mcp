@@ -1,6 +1,6 @@
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from jinja2 import Template
@@ -136,6 +136,83 @@ def test_chunk_merge_fills_schema_entries_omitted_by_model() -> None:
         "Order",
     ]
     assert merged["schemas"][1]["description_quality"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_chunk_retries_transient_provider_failure() -> None:
+    class RateLimitError(Exception):
+        status_code = 429
+
+    class FakeLLMClient:
+        provider = "azure"
+        model = "azure/test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_text(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                raise RateLimitError("try again")
+            return LLMResponse(
+                text=json.dumps(
+                    {
+                        "operations": [],
+                        "schemas": [],
+                        "security_schemes": [],
+                        "overall": {
+                            "overall_quality": "good",
+                            "completeness_score": 4,
+                            "ai_readiness_score": 4,
+                        },
+                    }
+                ),
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                model=self.model,
+            )
+
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "Example", "version": "1.0.0"},
+        "paths": {"/health": {"get": {"responses": {"200": {"description": "ok"}}}}},
+    }
+    fake_client = FakeLLMClient()
+    enhancer = OpenAPIEnhancer.__new__(OpenAPIEnhancer)
+    enhancer.llm_client = fake_client
+    enhancer.evaluation_template = Template("{{ openapi_spec }}")
+    enhancer.chunk_evaluation_template = Template("{{ openapi_spec }}")
+    request = EnhancementRequest(
+        spec_content=json.dumps(spec), spec_format="json", original_filename="example.json"
+    )
+    linting_results = LintingResult(
+        total_issues=0, linting_score=5, linting_summary="clean"
+    )
+
+    def get_int(key, default):
+        return {
+            "azure_chunk_prompt_tokens": 2_140,
+            "azure_chunk_prompt_overhead_tokens": 2_000,
+            "azure_chunk_max_tokens": 100,
+            "azure_chunk_retry_limit": 1,
+            "azure_max_concurrency": 1,
+        }.get(key, default)
+
+    with (
+        patch("src.services.openapi_enhancer.config.get_int", side_effect=get_int),
+        patch("src.services.openapi_enhancer.asyncio.sleep", new_callable=AsyncMock) as sleep,
+    ):
+        evaluation = await enhancer._evaluate_large_specification(
+            spec_dict=spec,
+            metadata={"api_title": "Example", "api_version": "1.0.0"},
+            request=request,
+            linting_results=linting_results,
+            max_tokens=100,
+            temperature=0.1,
+        )
+
+    assert fake_client.calls == 2
+    sleep.assert_awaited_once()
+    assert evaluation.llm_calls_count == 1
 
 
 @pytest.mark.asyncio
