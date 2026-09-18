@@ -10,6 +10,8 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 import aiosqlite
+from cryptography.fernet import Fernet
+from pydantic import SecretStr
 
 from .errors import (
     IdempotencyConflict,
@@ -97,6 +99,17 @@ class PayloadProtector(Protocol):
     def encrypt(self, plaintext: bytes) -> bytes: ...
 
     def decrypt(self, ciphertext: bytes) -> bytes: ...
+
+
+class FernetPayloadProtector:
+    def __init__(self, key: SecretStr) -> None:
+        self._fernet = Fernet(key.get_secret_value().encode("ascii"))
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        return self._fernet.encrypt(plaintext)
+
+    def decrypt(self, ciphertext: bytes) -> bytes:
+        return self._fernet.decrypt(ciphertext)
 
 
 class TransferStore(Protocol):
@@ -1274,3 +1287,27 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+async def create_payload_protector(settings: Any, resolver: Any) -> PayloadProtector:
+    if settings.data_encryption_key_ref is None:
+        raise RuntimeError("data_encryption_key_ref is required")
+    key_ref = settings.data_encryption_key_ref
+    if isinstance(key_ref, SecretStr):
+        resolved_ref = key_ref.get_secret_value()
+    else:
+        resolved_ref = str(key_ref)
+    bundle = await resolver.resolve(resolved_ref)
+    key = None
+    for candidate in ("value", "key", "fernet_key"):
+        if candidate in bundle.values:
+            key = bundle.values[candidate].get_secret_value()
+            break
+    if key is None and len(bundle.values) == 1:
+        key = next(iter(bundle.values.values())).get_secret_value()
+    if key is None:
+        raise RuntimeError("encryption key ref did not resolve to a value")
+    try:
+        return FernetPayloadProtector(SecretStr(key))
+    except Exception as exc:
+        raise RuntimeError("invalid Fernet key") from exc

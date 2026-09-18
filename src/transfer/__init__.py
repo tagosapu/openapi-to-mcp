@@ -37,8 +37,10 @@ from .models import (
     TransferStatus,
 )
 from .mapping import MappingEngine
+from .openapi_contract import ContractPreflight, ContractPreflightResult
+from .rest_connector import ConnectorRegistry, RestOpenApiConnector
 from .settings import TransferSettings
-from .store import PayloadProtector, SqliteTransferStore, TransferStore
+from .store import FernetPayloadProtector, PayloadProtector, SqliteTransferStore, TransferStore, create_payload_protector
 
 __all__ = [
     "AdditionalHeader",
@@ -47,6 +49,8 @@ __all__ = [
     "ConnectorPolicy",
     "CreateTransferResult",
     "DeliveryRequest",
+    "ContractPreflight",
+    "ContractPreflightResult",
     "IdempotencyConflict",
     "InvalidTransitionError",
     "MappingCondition",
@@ -65,9 +69,12 @@ __all__ = [
     "OperationSelection",
     "OutboundRequestParts",
     "PayloadLimitError",
+    "FernetPayloadProtector",
     "PayloadProtector",
     "PostconditionDefinition",
     "ProblemDetail",
+    "ConnectorRegistry",
+    "RestOpenApiConnector",
     "ReviewCorrection",
     "SqliteTransferStore",
     "TenantIsolationError",
@@ -80,4 +87,5 @@ __all__ = [
     "TransferSettings",
     "TransferStatus",
     "TransferStore",
+    "create_payload_protector",
 ]
