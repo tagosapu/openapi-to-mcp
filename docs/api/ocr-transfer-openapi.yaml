@@ -1,0 +1,1095 @@
+openapi: 3.1.0
+info:
+  title: OCR Transfer Connector API
+  version: 1.0.0
+  summary: Contract-first OCR transfer and connector management API.
+  description: Hand-authored canonical public contract for the OCR transfer subsystem.
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+servers:
+  - url: /
+tags:
+  - name: transfers
+  - name: mappings
+  - name: connectors
+  - name: health
+paths:
+  /v1/transfers:
+    post:
+      tags: [transfers]
+      operationId: createTransfer
+      summary: Accept an OCR transfer job.
+      security:
+        - OAuth2: [transfer:write]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Opaque idempotency key retained for at least 24 hours.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+        - name: X-Correlation-ID
+          in: header
+          required: false
+          description: Caller-supplied correlation identifier.
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferRequest'
+      responses:
+        '202':
+          description: Transfer job accepted for asynchronous processing.
+          headers:
+            X-Idempotent-Replay:
+              description: Present and true when the response replays an existing accepted job.
+              schema:
+                type: string
+                enum: ['true']
+            X-Correlation-ID:
+              description: Effective correlation identifier for the accepted request.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferAccepted'
+        '400':
+          description: Invalid JSON or request shape.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '401':
+          description: Authentication required.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '403':
+          description: Scope or tenant access denied.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '409':
+          description: Idempotency key reused with a different request hash.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '413':
+          description: Payload too large.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '415':
+          description: Unsupported media type.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '422':
+          description: Schema or mapping validation failed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+    get:
+      tags: [transfers]
+      operationId: listTransfers
+      summary: List transfer jobs for the authorized tenant.
+      security:
+        - OAuth2: [transfer:read]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/TransferStatus'
+        - name: connector_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: document_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: correlation_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: Transfer list page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferListResponse'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/transfers/{transfer_id}:
+    get:
+      tags: [transfers]
+      operationId: getTransfer
+      summary: Get transfer job details.
+      security:
+        - OAuth2: [transfer:read]
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+      responses:
+        '200':
+          description: Transfer job detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferDetail'
+        '404':
+          description: Transfer job not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/transfers/{transfer_id}/retry:
+    post:
+      tags: [transfers]
+      operationId: retryTransfer
+      summary: Request a retry for a transfer job.
+      security:
+        - OAuth2: [transfer:retry]
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+      responses:
+        '202':
+          description: Retry request accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionAccepted'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/transfers/{transfer_id}/cancel:
+    post:
+      tags: [transfers]
+      operationId: cancelTransfer
+      summary: Request cancellation of a transfer job.
+      security:
+        - OAuth2: [transfer:cancel]
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+      responses:
+        '202':
+          description: Cancellation request accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionAccepted'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/transfers/{transfer_id}/review:
+    post:
+      tags: [transfers]
+      operationId: reviewTransfer
+      summary: Review, reject, or correct a waiting transfer.
+      security:
+        - OAuth2: [transfer:review]
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewRequest'
+      responses:
+        '200':
+          description: Review decision recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferDetail'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/transfers/{transfer_id}/reconcile:
+    post:
+      tags: [transfers]
+      operationId: reconcileTransfer
+      summary: Record reconciliation evidence for a transfer job.
+      security:
+        - OAuth2: [transfer:reconcile]
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReconcileRequest'
+      responses:
+        '200':
+          description: Reconciliation recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferDetail'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/mappings/{mapping_id}/preview:
+    post:
+      tags: [mappings]
+      operationId: previewMapping
+      summary: Preview mapped outbound request materialization.
+      security:
+        - OAuth2: [mapping:read]
+      parameters:
+        - $ref: '#/components/parameters/MappingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MappingPreviewRequest'
+      responses:
+        '200':
+          description: Preview generated without sending to the target system.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MappingPreviewResponse'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/connectors:
+    get:
+      tags: [connectors]
+      operationId: listConnectors
+      summary: List connector metadata available to the caller.
+      security:
+        - OAuth2: [connector:read]
+      responses:
+        '200':
+          description: Connector list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectorListResponse'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+    post:
+      tags: [connectors]
+      operationId: createConnector
+      summary: Register a connector definition without inline secrets.
+      security:
+        - OAuth2: [connector:admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectorDefinition'
+      responses:
+        '201':
+          description: Connector definition created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectorRegistered'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/connectors/{connector_id}/validate:
+    post:
+      tags: [connectors]
+      operationId: validateConnector
+      summary: Validate a registered connector against its fixed OpenAPI snapshot.
+      security:
+        - OAuth2: [connector:admin]
+      parameters:
+        - $ref: '#/components/parameters/ConnectorId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectorValidationRequest'
+      responses:
+        '202':
+          description: Validation started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationAccepted'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/mappings:
+    get:
+      tags: [mappings]
+      operationId: listMappings
+      summary: List mapping metadata available to the caller.
+      security:
+        - OAuth2: [mapping:read]
+      responses:
+        '200':
+          description: Mapping list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MappingListResponse'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+    post:
+      tags: [mappings]
+      operationId: createMapping
+      summary: Register an immutable mapping definition.
+      security:
+        - OAuth2: [mapping:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MappingDefinition'
+      responses:
+        '201':
+          description: Mapping definition created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MappingRegistered'
+        default:
+          description: Problem details error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /v1/health/live:
+    get:
+      tags: [health]
+      operationId: getLiveness
+      summary: Liveness probe.
+      security: []
+      responses:
+        '200':
+          description: Process is live.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /v1/health/ready:
+    get:
+      tags: [health]
+      operationId: getReadiness
+      summary: Readiness probe.
+      security: []
+      responses:
+        '200':
+          description: Dependency readiness status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  parameters:
+    TransferId:
+      name: transfer_id
+      in: path
+      required: true
+      schema:
+        type: string
+    MappingId:
+      name: mapping_id
+      in: path
+      required: true
+      schema:
+        type: string
+    ConnectorId:
+      name: connector_id
+      in: path
+      required: true
+      schema:
+        type: string
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.example.com/oauth/token
+          scopes:
+            transfer:write: Submit OCR transfer jobs.
+            transfer:read: Read transfer job state.
+            transfer:retry: Retry failed transfer jobs.
+            transfer:cancel: Cancel queued or review-gated transfer jobs.
+            transfer:review: Approve, reject, or correct waiting transfer jobs.
+            transfer:reconcile: Reconcile jobs with unknown target outcome.
+            mapping:read: Read mappings and generate previews.
+            mapping:write: Create or publish mapping definitions.
+            connector:read: Read connector metadata.
+            connector:admin: Register and validate connectors.
+  schemas:
+    TransferRequest:
+      $ref: ../../schemas/ocr-transfer-v1.json
+    MappingDefinition:
+      $ref: ../../schemas/mapping-v1.json
+    TransferStatus:
+      type: string
+      enum:
+        - accepted
+        - validating
+        - waiting_review
+        - queued
+        - delivering
+        - retrying
+        - reconciliation_required
+        - cancellation_requested
+        - succeeded
+        - partially_succeeded
+        - failed
+        - cancelled
+    TransferAccepted:
+      type: object
+      additionalProperties: false
+      required:
+        - transfer_id
+        - status
+        - status_url
+        - connector_id
+        - mapping_id
+        - mapping_version
+        - created_at
+        - updated_at
+        - correlation_id
+        - attempt
+        - result
+        - error
+      properties:
+        transfer_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/TransferStatus'
+        status_url:
+          type: string
+        connector_id:
+          type: string
+        mapping_id:
+          type: string
+        mapping_version:
+          type: integer
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        correlation_id:
+          type: string
+        attempt:
+          type: integer
+          minimum: 0
+        result:
+          anyOf:
+            - $ref: '#/components/schemas/TransferResult'
+            - type: 'null'
+        error:
+          anyOf:
+            - $ref: '#/components/schemas/TransferErrorSummary'
+            - type: 'null'
+    TransferSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - transfer_id
+        - status
+        - connector_id
+        - mapping_id
+        - created_at
+        - updated_at
+        - correlation_id
+        - attempt
+      properties:
+        transfer_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/TransferStatus'
+        connector_id:
+          type: string
+        mapping_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        correlation_id:
+          type: string
+        attempt:
+          type: integer
+          minimum: 0
+    TransferDetail:
+      allOf:
+        - $ref: '#/components/schemas/TransferSummary'
+        - type: object
+          additionalProperties: false
+          properties:
+            status_url:
+              type: string
+            mapping_version:
+              type: integer
+              minimum: 1
+            validation_errors:
+              type: array
+              items:
+                $ref: '#/components/schemas/ValidationError'
+            result:
+              anyOf:
+                - $ref: '#/components/schemas/TransferResult'
+                - type: 'null'
+            error:
+              anyOf:
+                - $ref: '#/components/schemas/TransferErrorSummary'
+                - type: 'null'
+    TransferListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransferSummary'
+        next_cursor:
+          anyOf:
+            - type: string
+            - type: 'null'
+    TransferResult:
+      type: object
+      additionalProperties: false
+      properties:
+        target_resource_id:
+          type: string
+        target_request_id:
+          type: string
+        completed_at:
+          type: string
+          format: date-time
+        response_ref:
+          type: string
+    TransferErrorSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+        target_path:
+          type: string
+    ValidationError:
+      type: object
+      additionalProperties: false
+      required:
+        - message
+      properties:
+        source_path:
+          type: string
+        target_path:
+          type: string
+        rule:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+    ProblemDetails:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - title
+        - status
+        - code
+        - detail
+        - correlation_id
+        - retryable
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+        detail:
+          type: string
+        instance:
+          type: string
+        correlation_id:
+          type: string
+        retryable:
+          type: boolean
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationError'
+    ActionAccepted:
+      type: object
+      additionalProperties: false
+      required:
+        - transfer_id
+        - status
+        - correlation_id
+      properties:
+        transfer_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/TransferStatus'
+        correlation_id:
+          type: string
+        message:
+          type: string
+    ReviewRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - action
+      properties:
+        action:
+          type: string
+          enum:
+            - approve
+            - reject
+            - correct
+        correction_reason:
+          type: string
+        corrected_fields:
+          type: object
+          additionalProperties: true
+    ReconcileRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - resolution
+      properties:
+        resolution:
+          type: string
+          enum:
+            - confirmed_present
+            - confirmed_absent
+            - unresolved
+        target_resource_id:
+          type: string
+        notes:
+          type: string
+    MappingPreviewRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - connector_id
+        - operation
+        - document
+        - ocr
+        - metadata
+      properties:
+        connector_id:
+          type: string
+        operation:
+          type: string
+          enum:
+            - create
+            - update
+            - upsert
+            - batch_upsert
+        deduplication_key_path:
+          type: string
+          pattern: ^(?:|/(?:[^/~]|~0|~1)*)+$
+        document:
+          $ref: ../../schemas/ocr-transfer-v1.json#/$defs/document
+        ocr:
+          $ref: ../../schemas/ocr-transfer-v1.json#/$defs/ocr
+        metadata:
+          $ref: ../../schemas/ocr-transfer-v1.json#/$defs/metadata
+    MappingPreviewResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - method
+        - path
+        - headers
+        - query
+        - body
+        - validation
+      properties:
+        method:
+          type: string
+        path:
+          type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        query:
+          type: object
+          additionalProperties: true
+        body:
+          type: object
+        validation:
+          type: object
+          additionalProperties: false
+          required:
+            - passed
+          properties:
+            passed:
+              type: boolean
+            warnings:
+              type: array
+              items:
+                type: string
+            errors:
+              type: array
+              items:
+                $ref: '#/components/schemas/ValidationError'
+    ConnectorDefinition:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      additionalProperties: false
+      required:
+        - connector_id
+        - type
+        - display_name
+        - base_url
+        - credential_ref
+        - additional_headers
+        - policy
+      properties:
+        connector_id:
+          type: string
+          minLength: 1
+        type:
+          const: rest-openapi
+        display_name:
+          type: string
+          minLength: 1
+        base_url:
+          type: string
+          format: uri
+          pattern: ^https://
+        spec:
+          type: object
+          required:
+            - openapi
+            - info
+            - paths
+          properties:
+            openapi:
+              type: string
+            info:
+              type: object
+              required:
+                - title
+                - version
+              properties:
+                title:
+                  type: string
+                version:
+                  type: string
+              additionalProperties: true
+            paths:
+              type: object
+          additionalProperties: true
+        spec_ref:
+          type: string
+          minLength: 1
+        credential_ref:
+          type: string
+          pattern: ^(?!https?://)[a-z][a-z0-9+.-]*://[A-Za-z0-9._~!$&'()*+,;=:@%/-]+$
+        additional_headers:
+          type: array
+          items:
+            $ref: '#/$defs/additionalHeader'
+        policy:
+          $ref: '#/$defs/policy'
+      oneOf:
+        - required: [spec]
+          not:
+            required: [spec_ref]
+        - required: [spec_ref]
+          not:
+            required: [spec]
+      $defs:
+        additionalHeader:
+          type: object
+          additionalProperties: false
+          required:
+            - name
+          properties:
+            name:
+              type: string
+              minLength: 1
+            value:
+              type: string
+              minLength: 1
+            value_ref:
+              type: string
+              pattern: ^(?!https?://)[a-z][a-z0-9+.-]*://[A-Za-z0-9._~!$&'()*+,;=:@%/-]+$
+          oneOf:
+            - required: [value]
+              not:
+                required: [value_ref]
+            - required: [value_ref]
+              not:
+                required: [value]
+        policy:
+          type: object
+          additionalProperties: false
+          required:
+            - connect_timeout_seconds
+            - read_timeout_seconds
+            - total_timeout_seconds
+            - max_response_bytes
+            - max_redirects
+          properties:
+            connect_timeout_seconds:
+              type: integer
+              minimum: 1
+            read_timeout_seconds:
+              type: integer
+              minimum: 1
+            total_timeout_seconds:
+              type: integer
+              minimum: 1
+            max_response_bytes:
+              type: integer
+              minimum: 1
+            max_redirects:
+              type: integer
+              minimum: 0
+    ConnectorSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - connector_id
+        - type
+        - display_name
+        - base_url
+      properties:
+        connector_id:
+          type: string
+        type:
+          type: string
+        display_name:
+          type: string
+        base_url:
+          type: string
+          format: uri
+        capabilities:
+          type: array
+          items:
+            type: string
+    ConnectorRegistered:
+      allOf:
+        - $ref: '#/components/schemas/ConnectorSummary'
+        - type: object
+          additionalProperties: false
+          properties:
+            spec_ref:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+    ConnectorListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectorSummary'
+    ConnectorValidationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        mode:
+          type: string
+          enum:
+            - structural
+            - dry-run-write
+            - sandbox-write
+        write_validation:
+          type: boolean
+    ValidationAccepted:
+      type: object
+      additionalProperties: false
+      required:
+        - validation_id
+        - status
+      properties:
+        validation_id:
+          type: string
+        status:
+          type: string
+          enum: [accepted]
+        status_url:
+          type: string
+    MappingListItem:
+      type: object
+      additionalProperties: false
+      required:
+        - mapping_id
+        - version
+        - connector_id
+        - document_types
+        - operations
+      properties:
+        mapping_id:
+          type: string
+        version:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+        connector_id:
+          type: string
+        document_types:
+          type: array
+          items:
+            type: string
+        operations:
+          type: array
+          items:
+            type: string
+    MappingRegistered:
+      allOf:
+        - $ref: '#/components/schemas/MappingListItem'
+        - type: object
+          additionalProperties: false
+          properties:
+            target_schema_ref:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+    MappingListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MappingListItem'
+    HealthStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - checked_at
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+            - degraded
+            - failed
+        checked_at:
+          type: string
+          format: date-time
+        dependencies:
+          type: object
+          additionalProperties:
+            type: string

@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openapi-to-mcp.local/schemas/mapping-v1.json",
+  "title": "Mapping Definition",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "mapping_id",
+    "version",
+    "connector_id",
+    "document_types",
+    "operations",
+    "deduplication_key_path",
+    "target_schema_ref",
+    "rules"
+  ],
+  "properties": {
+    "mapping_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "published",
+        "deprecated"
+      ]
+    },
+    "connector_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "document_types": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": [
+          "create",
+          "update",
+          "upsert",
+          "batch_upsert"
+        ]
+      }
+    },
+    "deduplication_key_path": {
+      "$ref": "#/$defs/jsonPointer"
+    },
+    "target_schema_ref": {
+      "type": "string",
+      "pattern": "^openapi:#(?:/(?:[^/~]|~0|~1)*)+$",
+      "description": "Local JSON Pointer into the registered OpenAPI snapshot, prefixed with openapi:."
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    }
+  },
+  "$defs": {
+    "jsonPointer": {
+      "type": "string",
+      "pattern": "^(?:|/(?:[^/~]|~0|~1)*)+$"
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "target",
+        "required",
+        "on_missing"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/jsonPointer"
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "location"
+          ],
+          "properties": {
+            "location": {
+              "type": "string",
+              "enum": [
+                "path",
+                "query",
+                "header",
+                "body"
+              ]
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pointer": {
+              "$ref": "#/$defs/jsonPointer"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "location": {
+                    "const": "body"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "pointer"
+                ],
+                "not": {
+                  "required": [
+                    "name"
+                  ]
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "location": {
+                    "enum": [
+                      "path",
+                      "query",
+                      "header"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "name"
+                ],
+                "not": {
+                  "required": [
+                    "pointer"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "on_missing": {
+          "type": "string",
+          "enum": [
+            "error",
+            "skip",
+            "null",
+            "default"
+          ]
+        }
+      }
+    }
+  }
+}

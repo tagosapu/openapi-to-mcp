@@ -32,6 +32,12 @@ dependencies = [
     "anthropic>=0.35.0",
     "bandit>=1.8.5",
     "fastapi>=0.115.13",
+    "aiosqlite>=0.22.1",
+    "jsonpointer>=3.1.1",
+    "jsonref>=1.1.0",
+    "pyjwt[crypto]>=2.14.0",
+    "uvicorn>=0.35.0",
+    "cryptography>=45.0.5",
 ]
 
 [project.scripts]
@@ -57,6 +63,8 @@ Repository = "https://github.com/example/openapi-to-mcp"
 [dependency-groups]
 dev = [
     "bandit>=1.8.5",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.1.0",
 ]
 
 [tool.black]
