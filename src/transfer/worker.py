@@ -268,13 +268,17 @@ class TransferWorker:
             try:
                 worked = await self.run_once()
             except Exception:
-                worked = True
+                await self._wait_for_poll_interval()
+                continue
             if worked:
                 continue
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=_WORKER_POLL_SECONDS)
-            except TimeoutError:
-                continue
+            await self._wait_for_poll_interval()
+
+    async def _wait_for_poll_interval(self) -> None:
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=_WORKER_POLL_SECONDS)
+        except TimeoutError:
+            return
 
     async def _handle_validate_claim(self, record: TransferRecord) -> None:
         try:

@@ -856,6 +856,34 @@ async def test_worker_start_persists_job_failure_and_continues_to_next_job(store
 
 
 @pytest.mark.asyncio
+async def test_worker_start_backs_off_after_run_once_exception(store, monkeypatch) -> None:
+    worker = TransferWorker(store, FakeRegistry({}), MappingEngine(), RetryPolicy(jitter_ratio=0.0))
+    attempts = 0
+    wait_calls = 0
+
+    async def fake_run_once() -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("loop boom")
+        worker._stop_event.set()
+        return True
+
+    async def fake_wait_for_poll_interval() -> None:
+        nonlocal wait_calls
+        wait_calls += 1
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(worker, "run_once", fake_run_once)
+    monkeypatch.setattr(worker, "_wait_for_poll_interval", fake_wait_for_poll_interval)
+
+    await asyncio.wait_for(worker._run_loop(), timeout=1)
+
+    assert attempts == 2
+    assert wait_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_worker_review_approve_revalidates_latest_correction(store, monkeypatch) -> None:
     await _save_prereqs(store)
     connector = FakeConnector()

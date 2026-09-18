@@ -194,3 +194,52 @@ Full suite output:
 
 - run loop の broad catch はワーカー停止を防ぐための最小修正で、予期しない store-level 例外の詳細ログはまだ持っていない。
 - 既存の Pydantic deprecation warnings は今回も継続しているが、この修正スコープの外と判断した。
+
+## Fix Round 2026-09-18 Hot Loop Backoff
+
+### Reviewer Finding Addressed
+
+1. _run_loop() が run_once() の予期しない例外後に即 continue し、永続例外で CPU hot loop を起こす問題を修正。
+	Files: src/transfer/worker.py, tests/transfer/test_worker.py
+	Change: 例外経路でも poll interval ベースの awaitable wait を通す _wait_for_poll_interval() を追加し、blocking sleep を使わず stop() に即応できる backoff を入れた。成功ジョブ継続や idle poll の既存挙動は維持した。
+
+### Regression Tests Added
+
+- run_once() が 1 回例外を投げても start loop が wait を挟んで再試行し、次イテレーションで回復できる回帰テスト
+
+### Commands And Outputs
+
+Focused regression command:
+
+```bash
+uv run pytest tests/transfer/test_worker.py tests/transfer/test_store.py -q
+```
+
+Focused regression output:
+
+```text
+44 passed, 2 warnings in 4.22s
+```
+
+Full suite command:
+
+```bash
+uv run pytest -q
+```
+
+Full suite output:
+
+```text
+136 passed, 2 warnings in 4.34s
+```
+
+### Self-Review
+
+- 例外 backoff は _stop_event.wait() を timeout 付きで await する形なので、sleep ベースの非応答は入っていない。
+- wait の共通化により、idle poll と exception retry で同じ停止応答性を保っている。
+- 既存の per-job failure persistence や retry/error classification、state clearing、actor まわりの挙動は変更していない。
+
+### Concerns
+
+- 予期しない例外の詳細ログは依然としてなく、今回は CPU hot loop 防止に限定した。
+- 既存の Pydantic deprecation warnings は継続しているが、この修正スコープ外と判断した。
