@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sqlite3
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
@@ -20,7 +21,6 @@ from src.transfer.app import create_app, current_principal
 from src.transfer.auth import Principal
 from src.transfer.models import TransferStatus
 from src.transfer.rest_connector import RestOpenApiConnector
-from src.transfer.worker import RetryPolicy, TransferWorker
 from tests.transfer.conftest import settings_factory
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +54,8 @@ class TargetApi:
         self.invoices: dict[str, dict[str, Any]] = {}
         self.calls: Counter[str] = Counter()
         self.auth_failures = 0
+        self.query_lookup_external_ids: list[str] = []
+        self.query_lookup_api_versions: list[str | None] = []
         self.fail_next_429 = False
         self.validation_error_next = False
         self.drop_next: str | None = None
@@ -114,6 +116,28 @@ class TargetApi:
                 )
             invoice = self._find_invoice(prefix, requested_id)
             return JSONResponse(status_code=200, content={"items": [invoice] if invoice else []})
+
+        @self.app.get("/{prefix}/invoices/lookup")
+        async def find_invoice_by_query(prefix: str, request: Request) -> JSONResponse:
+            variant = self.variants.get(prefix)
+            if variant is None:
+                return JSONResponse(status_code=404, content={"code": "UNKNOWN_TARGET"})
+            auth_error = self._authorize(prefix, request, variant)
+            if auth_error is not None:
+                return auth_error
+            self.calls[f"GET:{prefix}"] += 1
+            requested_id = request.query_params.get("external_id")
+            if not requested_id:
+                return JSONResponse(
+                    status_code=400,
+                    content={"code": "VALIDATION_ERROR", "message": "external_id is required"},
+                )
+            self.query_lookup_external_ids.append(requested_id)
+            self.query_lookup_api_versions.append(request.headers.get("X-Api-Version"))
+            invoice = self._find_invoice(prefix, requested_id)
+            if invoice is None:
+                return JSONResponse(status_code=404, content={"code": "NOT_FOUND"})
+            return JSONResponse(status_code=200, content=invoice)
 
         @self.app.get("/{prefix}/invoices/{external_id}")
         async def get_invoice(prefix: str, external_id: str, request: Request) -> JSONResponse:
@@ -279,10 +303,25 @@ class TargetApi:
 
 
 class AppClient:
-    def __init__(self, app: FastAPI, client: httpx.AsyncClient, target_api: TargetApi) -> None:
+    def __init__(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        target_api: TargetApi,
+        lifespan: Any,
+    ) -> None:
         self.app = app
         self.client = client
         self.target_api = target_api
+        self._lifespan = lifespan
+        self._closed = False
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self.client.aclose()
+        await self._lifespan.__aexit__(None, None, None)
 
     async def register(
         self,
@@ -292,8 +331,9 @@ class AppClient:
         auth_mode: str | None = None,
         prefix: str,
         api_version: str,
+        spec_override: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
-        spec = _load_yaml(spec_name)
+        spec = deepcopy(spec_override) if spec_override is not None else _load_yaml(spec_name)
         if auth_mode is not None:
             spec = _auth_variant(spec, auth_mode=auth_mode, prefix=prefix)
             self.target_api.register_variant(
@@ -410,6 +450,103 @@ def _load_yaml(name: str) -> dict[str, Any]:
     return yaml.safe_load((FIXTURES_DIR / name).read_text(encoding="utf-8"))
 
 
+def _query_lookup_spec() -> dict[str, Any]:
+    spec = _load_yaml("target_openapi.yaml")
+    spec["paths"]["/target/invoices/lookup"] = {
+        "get": {
+            "operationId": "findInvoiceByQuery",
+            "security": [{"apiKeyAuth": []}],
+            "parameters": [
+                {"$ref": "#/components/parameters/ApiVersion"},
+                {
+                    "name": "external_id",
+                    "in": "query",
+                    "required": True,
+                    "schema": {"type": "string"},
+                },
+            ],
+            "responses": {
+                "200": {
+                    "description": "Invoice found by external ID.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/InvoiceResponse"}
+                        }
+                    },
+                },
+                "404": {
+                    "description": "Invoice not found.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/Problem"}
+                        }
+                    },
+                },
+                "500": {
+                    "description": "Target failure.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/Problem"}
+                        }
+                    },
+                },
+            },
+        }
+    }
+    for binding in spec["x-openapi-to-mcp-operation-bindings"].values():
+        binding["lookup_operation_id"] = "findInvoiceByQuery"
+        binding["lookup_parameter_location"] = "query"
+        binding["postcondition"]["reconcile_operation_id"] = "findInvoiceByQuery"
+    return spec
+
+
+def _persisted_transfer_text(database_path: str | Path, transfer_id: str) -> list[str]:
+    with sqlite3.connect(database_path) as connection:
+        transfer = connection.execute(
+            """
+            SELECT tenant_id, connector_id, mapping_id, request_json, result_json, error_json
+            FROM transfers
+            WHERE transfer_id = ?
+            """,
+            (transfer_id,),
+        ).fetchone()
+        assert transfer is not None
+        tenant_id, connector_id, mapping_id, *transfer_values = transfer
+        values = [value for value in transfer_values if value is not None]
+        values.extend(
+            row[0]
+            for row in connection.execute(
+                "SELECT detail_json FROM transfer_events WHERE tenant_id = ? AND transfer_id = ?",
+                (tenant_id, transfer_id),
+            ).fetchall()
+        )
+        values.extend(
+            value
+            for row in connection.execute(
+                """
+                SELECT config_json, spec_json
+                FROM connectors
+                WHERE tenant_id = ? AND connector_id = ?
+                """,
+                (tenant_id, connector_id),
+            ).fetchall()
+            for value in row
+            if value is not None
+        )
+        values.extend(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT definition_json
+                FROM mappings
+                WHERE tenant_id = ? AND mapping_id = ?
+                """,
+                (tenant_id, mapping_id),
+            ).fetchall()
+        )
+    return [str(value) for value in values]
+
+
 def _credential_mode(auth_mode: str | None, spec_name: str) -> str:
     if auth_mode is not None:
         return auth_mode
@@ -482,6 +619,25 @@ def invoice_payload(
     return payload
 
 
+def _integration_principal() -> Principal:
+    return Principal(
+        tenant_id="tenant-a",
+        subject="integration-test",
+        scopes=frozenset(
+            {
+                "transfer:write",
+                "transfer:read",
+                "transfer:retry",
+                "transfer:reconcile",
+                "mapping:read",
+                "mapping:write",
+                "connector:read",
+                "connector:admin",
+            }
+        ),
+    )
+
+
 @pytest.fixture
 def target_api() -> TargetApi:
     target = TargetApi()
@@ -530,36 +686,25 @@ async def app_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Any:
     app = create_app(integration_settings)
-    principal = Principal(
-        tenant_id="tenant-a",
-        subject="integration-test",
-        scopes=frozenset(
-            {
-                "transfer:write",
-                "transfer:read",
-                "transfer:retry",
-                "transfer:reconcile",
-                "mapping:read",
-                "mapping:write",
-                "connector:read",
-                "connector:admin",
-            }
-        ),
-    )
-    app.dependency_overrides[current_principal] = lambda: principal
+    app.dependency_overrides[current_principal] = _integration_principal
 
     def target_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
         kwargs["transport"] = httpx.ASGITransport(app=target_api.app)
         return _REAL_ASYNC_CLIENT(*args, **kwargs)
 
     monkeypatch.setattr(RestOpenApiConnector.__init__.__globals__["httpx"], "AsyncClient", target_client)
-    async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app)
-        async with _REAL_ASYNC_CLIENT(
-            transport=transport,
-            base_url="http://testserver",
-        ) as client:
-            yield AppClient(app, client, target_api)
+    lifespan = app.router.lifespan_context(app)
+    await lifespan.__aenter__()
+    transport = httpx.ASGITransport(app=app)
+    client = _REAL_ASYNC_CLIENT(
+        transport=transport,
+        base_url="http://testserver",
+    )
+    app_client = AppClient(app, client, target_api, lifespan)
+    try:
+        yield app_client
+    finally:
+        await app_client.close()
 
 
 @pytest.mark.asyncio
@@ -673,6 +818,7 @@ async def test_basic_and_oauth_credentials_use_existing_connector_auth(
     prefix: str,
     api_version: str,
     connector_id: str,
+    integration_settings: Any,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     connector_id, mapping_id = await app_client.register(
@@ -689,13 +835,18 @@ async def test_basic_and_oauth_credentials_use_existing_connector_auth(
         mapping_id=mapping_id,
     )
     response = await app_client.post_transfer(payload, key=f"key-{auth_mode}")
-    completed = await app_client.wait_for_status(response.json()["transfer_id"], "succeeded")
+    transfer_id = response.json()["transfer_id"]
+    completed = await app_client.wait_for_status(transfer_id, "succeeded")
     assert completed["result"]["target_resource_id"]
     assert target_api.auth_failures == 0
     if auth_mode == "oauth2":
         assert target_api.oauth_token_calls == 2
+    public_text = json.dumps(completed, sort_keys=True)
+    persisted_text = _persisted_transfer_text(integration_settings.database_path, transfer_id)
     for secret in SECRET_VALUES:
         assert secret not in caplog.text
+        assert secret not in public_text
+        assert all(secret not in value for value in persisted_text)
 
 
 @pytest.mark.asyncio
@@ -748,10 +899,11 @@ async def test_retrying_429_and_target_validation_error_are_observable(
 
 
 @pytest.mark.asyncio
-async def test_unknown_outcome_reconciles_absent_then_resends_and_present_without_resend(
+async def test_unknown_outcome_internal_lookup_resends_absent_and_public_evidence_confirms_present(
     app_client: AppClient,
     target_api: TargetApi,
 ) -> None:
+    """Internal target lookup and public operator evidence use separate paths."""
     connector_id, mapping_id = await app_client.register(
         "target_openapi.yaml",
         "invoice-reconcile",
@@ -802,8 +954,78 @@ async def test_unknown_outcome_reconciles_absent_then_resends_and_present_withou
 
 
 @pytest.mark.asyncio
+async def test_public_unresolved_reconciliation_records_evidence_without_resend(
+    app_client: AppClient,
+    target_api: TargetApi,
+) -> None:
+    connector_id, mapping_id = await app_client.register(
+        "target_openapi.yaml",
+        "invoice-unresolved",
+        prefix="target",
+        api_version="2026-01-01",
+    )
+    target_api.drop_next = "before_write"
+    payload = invoice_payload(
+        operation="upsert",
+        suffix="unresolved-001",
+        connector_id=connector_id,
+        mapping_id=mapping_id,
+    )
+    response = await app_client.post_transfer(payload, key="key-unresolved-001")
+    transfer_id = response.json()["transfer_id"]
+    await app_client.wait_for_status(transfer_id, "reconciliation_required")
+    put_calls_before_evidence = target_api.count("PUT", "target")
+
+    unresolved = await app_client.reconcile_with_evidence(
+        transfer_id,
+        {
+            "resolution": "unresolved",
+            "notes": "operator could not establish the target state",
+        },
+    )
+
+    assert unresolved["status"] == "reconciliation_required"
+    assert (await app_client.get_transfer(transfer_id))["status"] == "reconciliation_required"
+    assert target_api.count("GET", "target") == 0
+    assert target_api.count("PUT", "target") == put_calls_before_evidence
+
+
+@pytest.mark.asyncio
+async def test_query_lookup_reconciliation_uses_target_auth_and_api_version(
+    app_client: AppClient,
+    target_api: TargetApi,
+) -> None:
+    connector_id, mapping_id = await app_client.register(
+        "target_openapi.yaml",
+        "invoice-query",
+        prefix="target",
+        api_version="2026-01-01",
+        spec_override=_query_lookup_spec(),
+    )
+    target_api.drop_next = "after_write"
+    payload = invoice_payload(
+        operation="upsert",
+        suffix="query-001",
+        connector_id=connector_id,
+        mapping_id=mapping_id,
+    )
+    response = await app_client.post_transfer(payload, key="key-query-001")
+    transfer_id = response.json()["transfer_id"]
+    await app_client.wait_for_status(transfer_id, "reconciliation_required")
+
+    reconciled = await app_client.reconcile_automatically(transfer_id)
+
+    assert reconciled["status"] == "succeeded"
+    assert target_api.query_lookup_external_ids == ["INV-query-001"]
+    assert target_api.query_lookup_api_versions == ["2026-01-01"]
+    assert target_api.auth_failures == 0
+    assert target_api.count("PUT", "target") == 1
+
+
+@pytest.mark.asyncio
 async def test_restart_recovery_moves_delivering_to_reconciliation_required(
     app_client: AppClient,
+    integration_settings: Any,
     target_api: TargetApi,
 ) -> None:
     connector_id, mapping_id = await app_client.register(
@@ -825,13 +1047,17 @@ async def test_restart_recovery_moves_delivering_to_reconciliation_required(
     assert claim is not None
     assert claim.record.status == TransferStatus.DELIVERING
 
-    recovered_worker = TransferWorker(
-        app_client.app.state.store,
-        app_client.app.state.registry,
-        app_client.app.state.mapping_engine,
-        RetryPolicy.from_settings(app_client.app.state.settings),
-    )
-    await recovered_worker.recover_inflight()
-    recovered = await app_client.get_transfer(transfer_id)
-    assert recovered["status"] == "reconciliation_required"
+    await app_client.close()
+
+    second_app = create_app(integration_settings)
+    second_app.dependency_overrides[current_principal] = _integration_principal
+    async with second_app.router.lifespan_context(second_app):
+        transport = httpx.ASGITransport(app=second_app)
+        async with _REAL_ASYNC_CLIENT(
+            transport=transport,
+            base_url="http://testserver",
+        ) as second_client:
+            recovered_response = await second_client.get(f"/v1/transfers/{transfer_id}")
+            assert recovered_response.status_code == 200, recovered_response.text
+            assert recovered_response.json()["status"] == "reconciliation_required"
     assert target_api.count("PUT", "target") == 0

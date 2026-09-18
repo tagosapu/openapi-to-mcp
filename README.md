@@ -248,13 +248,134 @@ AZURE_OPENAI_API_VERSION=2024-10-21
 
 ## OCR Transfer API
 
-The OCR transfer service accepts the canonical `ocr-transfer/v1` JSON contract and delivers one document at a time through a registered REST/OpenAPI connector. Copy `env.example` to `.env`, configure the `TRANSFER_*` settings, and start the service with:
+The OCR transfer service accepts the canonical `ocr-transfer/v1` JSON contract and delivers one document at a time through a registered REST/OpenAPI connector. It validates caller JWTs against an existing identity provider; this repository does not provide a local token issuer.
+
+Copy `env.example` to `.env` and set these server-side values before starting the service:
+
+```dotenv
+TRANSFER_DATABASE_PATH=./data/transfer.sqlite3
+TRANSFER_JWT_ISSUER=https://issuer.example.com/
+TRANSFER_JWT_AUDIENCE=ocr-transfer
+TRANSFER_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
+TRANSFER_ALLOWED_HOSTS=["127.0.0.1","localhost","target.example.com"]
+TRANSFER_MAX_PAYLOAD_BYTES=1048576
+TRANSFER_MAX_ATTEMPTS=5
+TRANSFER_WORKER_ENABLED=true
+TRANSFER_WORKER_POLL_SECONDS=1
+TRANSFER_REQUESTS_PER_MINUTE=120
+TRANSFER_BURST=20
+TRANSFER_DATA_ENCRYPTION_KEY_REF=key://transfer/data
+TRANSFER_CREDENTIALS_JSON={"vault://connectors/invoice-target":{"auth":"REPLACE_WITH_TARGET_SECRET"},"config://headers/target-api-version":{"value":"2026-01-01"},"key://transfer/data":"REPLACE_WITH_FERNET_KEY"}
+```
+
+`TRANSFER_CREDENTIALS_JSON` is the resolver input: connector `credential_ref` values select a credential bundle, `config://...` values provide non-secret connector headers, and the `key://...` entry supplies the Fernet key referenced by `TRANSFER_DATA_ENCRYPTION_KEY_REF`. Keep the replacement values in a protected environment or secret manager. The retention settings in `env.example` control idempotency, payload, and audit retention and have defaults.
+
+`TRANSFER_TEST_TOKEN` is a client-side variable containing an already-issued JWT, not a token that the service creates. The JWT must contain `iss`, `aud`, `exp`, `sub`, and `tenant_id` claims; `tenant_id` must match the transfer metadata, and `sub` identifies the caller. The setup and transfer commands below need `connector:admin`, `connector:read`, `mapping:write`, `mapping:read`, `transfer:write`, and `transfer:read` scopes. Reconciliation commands additionally need `transfer:reconcile`.
+
+Start the service with:
 
 ```bash
 uv run ocr-transfer-api --host 127.0.0.1 --port 8080
 ```
 
-Register a connector with `POST /v1/connectors` using an inline OpenAPI snapshot. The snapshot must include the operation bindings extension for `create`, `update`, and `upsert`. Set `credential_ref` to a resolver reference, and declare the required `X-Api-Version` header with a non-secret `value_ref`. Register the published mapping with `POST /v1/mappings`; its `connector_id`, supported operations, deduplication path, and `target_schema_ref` must match the connector contract. Credential values stay in the configured resolver and never belong in the OpenAPI, mapping, or OCR JSON.
+Register a connector with `POST /v1/connectors` using an inline, secret-free OpenAPI snapshot. The snapshot must include the operation bindings extension for `create`, `update`, and `upsert`. The following creates a request file from a JSON snapshot at a placeholder path; the snapshot must define those bindings and the target schema referenced by the mapping. Replace the base URL and allowed host with the real target host, but do not put target credentials in the snapshot:
+
+```bash
+export TRANSFER_TEST_TOKEN=REPLACE_WITH_AN_ALREADY_ISSUED_JWT
+export TARGET_OPENAPI_JSON=/path/to/target-openapi.json
+
+jq --slurpfile target_spec "$TARGET_OPENAPI_JSON" '{
+  "connector_id": "invoice-target",
+  "type": "rest-openapi",
+  "display_name": "Invoice target",
+  "base_url": "https://target.example.com/",
+  "spec": $target_spec[0],
+  "credential_ref": "vault://connectors/invoice-target",
+  "additional_headers": [
+    {"name": "X-Api-Version", "value_ref": "config://headers/target-api-version"}
+  ],
+  "policy": {
+    "connect_timeout_seconds": 5,
+    "read_timeout_seconds": 30,
+    "total_timeout_seconds": 60,
+    "max_response_bytes": 1048576,
+    "max_redirects": 0
+  }
+}' > /tmp/invoice-connector-registration.json
+
+curl \
+  -H "Authorization: Bearer ${TRANSFER_TEST_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data @/tmp/invoice-connector-registration.json \
+  http://127.0.0.1:8080/v1/connectors
+```
+
+Register a published mapping whose `connector_id`, operations, deduplication path, and `target_schema_ref` match that snapshot. This request is secret-free; save it as `/tmp/invoice-mapping.json` or use an equivalent file path:
+
+```bash
+cat > /tmp/invoice-mapping.json <<'JSON'
+{
+  "mapping_id": "invoice-v1",
+  "version": 1,
+  "status": "published",
+  "connector_id": "invoice-target",
+  "document_types": ["invoice"],
+  "operations": ["create", "update", "upsert"],
+  "deduplication_key_path": "/ocr/fields/invoice_number/value",
+  "target_schema_ref": "openapi:#/components/schemas/InvoiceUpsertRequest",
+  "rules": [
+    {
+      "rule_id": "external-id-body",
+      "source": "/ocr/fields/invoice_number/value",
+      "target": {"location": "body", "pointer": "/external_id"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    },
+    {
+      "rule_id": "external-id-path",
+      "source": "/ocr/fields/invoice_number/value",
+      "target": {"location": "path", "name": "external_id"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    },
+    {
+      "rule_id": "invoice-number",
+      "source": "/ocr/fields/invoice_number/value",
+      "target": {"location": "body", "pointer": "/invoice_number"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    },
+    {
+      "rule_id": "total-amount",
+      "source": "/ocr/fields/total_amount/value",
+      "target": {"location": "body", "pointer": "/total_amount"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    },
+    {
+      "rule_id": "source-document",
+      "source": "/document/document_id",
+      "target": {"location": "body", "pointer": "/source_document_id"},
+      "required": true,
+      "on_missing": "error",
+      "transforms": []
+    }
+  ]
+}
+JSON
+
+curl \
+  -H "Authorization: Bearer ${TRANSFER_TEST_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data @/tmp/invoice-mapping.json \
+  http://127.0.0.1:8080/v1/mappings
+```
+
+Credential values stay in the configured resolver and never belong in the OpenAPI, mapping, or OCR JSON. The mapping above assumes the target snapshot exposes `InvoiceUpsertRequest`; use the component name and binding paths from the target API instead of copying it blindly.
 
 Submit a secret-free standard OCR document after registration:
 
@@ -267,7 +388,7 @@ curl \
   http://127.0.0.1:8080/v1/transfers
 ```
 
-Use the returned `transfer_id` with `GET /v1/transfers/{transfer_id}`. A delivery with an unknown outcome is held in `reconciliation_required`; it is not automatically resent. An operator can confirm a resource, confirm it is absent so the queued transfer may be resent, or leave it unresolved with `POST /v1/transfers/{transfer_id}/reconcile`:
+Use the returned `transfer_id` with `GET /v1/transfers/{transfer_id}`. A delivery with an unknown outcome is held in `reconciliation_required`; it is not automatically resent. Internal worker reconciliation may perform an automatic target lookup, but the public reconcile endpoint records operator evidence. An operator can confirm a resource, confirm it is absent so the queued transfer may be resent, or leave it unresolved; `unresolved` keeps the transfer in `reconciliation_required` and does not resend it:
 
 ```bash
 curl \
