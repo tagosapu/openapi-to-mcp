@@ -181,6 +181,7 @@ class ContractPreflight:
 def canonicalize_public_spec(spec: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(spec)
     normalized.pop("x-openapi-to-mcp-registration-hosts", None)
+    normalized.pop("x-openapi-to-mcp-registration-oauth-hosts", None)
     return normalized
 
 

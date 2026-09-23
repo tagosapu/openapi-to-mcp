@@ -377,6 +377,40 @@ async def test_send_refreshes_oauth_token_once_on_expired_401() -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_request_rejects_oauth_token_ssrf() -> None:
+    from src.transfer.rest_connector import RestOpenApiConnector
+
+    spec = _base_spec(
+        {
+            "type": "oauth2",
+            "flows": {
+                "clientCredentials": {
+                    "tokenUrl": "http://169.254.169.254/oauth/token",
+                    "scopes": {},
+                }
+            },
+        }
+    )
+    connector = RestOpenApiConnector(
+        _definition(spec),
+        MappingEngine(),
+        StaticCredentialResolver(
+            {
+                "vault://connectors/connector-test": {
+                    "client_id": "client-id",
+                    "client_secret": "client-secret",
+                },
+                "config://headers/x-api-version": {"value": "2026-09-18"},
+            }
+        ),
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200))),
+    )
+
+    with pytest.raises(ValueError, match="SSRF_ADDRESS_BLOCKED"):
+        await connector.build_request(_parts())
+
+
+@pytest.mark.asyncio
 async def test_send_rejects_redirects_and_response_size_limit() -> None:
     from src.transfer.rest_connector import RestOpenApiConnector
 
@@ -566,6 +600,15 @@ async def test_send_and_classify_timeout_unknown_429_and_5xx() -> None:
 
     assert rate_limited.retryable is True
     assert rate_limited.retry_after_seconds == 7
+    for status_code in (408, 425):
+        retryable = connector.classify_error(
+            connector._build_outcome(
+                httpx.Response(status_code, headers={"Retry-After": "3"}),
+                body_bytes=b"",
+            )
+        )
+        assert retryable.retryable is True
+        assert retryable.retry_after_seconds == 3
     assert server_error.code == "HTTP_5XX"
 
 

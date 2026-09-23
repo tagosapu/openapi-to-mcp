@@ -27,6 +27,7 @@ from .settings import TransferSettings as Settings
 
 INTERNAL_ERROR_CODE_HEADER = "x-openapi-to-mcp-error-code"
 PROTECTED_HEADERS = {"authorization", "content-length", "cookie", "host"}
+OAUTH_REGISTRATION_HOSTS_EXTENSION = "x-openapi-to-mcp-registration-oauth-hosts"
 
 
 @dataclass(slots=True)
@@ -56,6 +57,7 @@ class RestOpenApiConnector:
         self._registration_addresses = definition.spec.get("x-openapi-to-mcp-registration-hosts")
         if not isinstance(self._registration_addresses, list):
             self._registration_addresses = resolve_host_addresses(definition.base_url.host)
+        self._oauth_registration_addresses = _oauth_registration_addresses(definition.spec)
 
     async def validate_config(self) -> ContractPreflightResult:
         return self._preflight
@@ -229,9 +231,9 @@ class RestOpenApiConnector:
                 retry_after_seconds=_retry_after_seconds(outcome.headers),
             )
         status_code = outcome.status_code
-        if status_code == 429:
+        if status_code in {408, 425, 429}:
             return ErrorClassification(
-                code="HTTP_429",
+            code=f"HTTP_{status_code}",
                 retryable=True,
                 delivery_state=outcome.delivery_state,
                 retry_after_seconds=_retry_after_seconds(outcome.headers),
@@ -391,6 +393,11 @@ class RestOpenApiConnector:
         token_url = scheme.get("flows", {}).get("clientCredentials", {}).get("tokenUrl")
         if not isinstance(token_url, str):
             raise ValueError("OAUTH_TOKEN_URL_MISSING")
+        token_url_object = httpx.URL(token_url)
+        self._validate_target(
+            token_url_object,
+            self._oauth_registration_addresses.get(token_url_object.host),
+        )
         cache_key = (scheme_name, token_url)
         cached = self._oauth_tokens.get(cache_key)
         if cached is not None and cached.expires_at > datetime.now(UTC) + timedelta(seconds=30):
@@ -400,7 +407,7 @@ class RestOpenApiConnector:
             "scope": " ".join(scopes),
         }
         response = await self._http_client.post(
-            token_url,
+            str(token_url_object),
             data=data,
             auth=(
                 _bundle_secret_value(bundle, preferred=("client_id", "username", "user")),
@@ -450,15 +457,22 @@ class RestOpenApiConnector:
         return operation
 
     def _validate_send_target(self, url: httpx.URL) -> None:
+        self._validate_target(url, self._registration_addresses)
+
+    def _validate_target(
+        self,
+        url: httpx.URL,
+        registration_addresses: list[str] | None,
+    ) -> None:
+        if url.scheme not in {"http", "https"} or url.host is None:
+            raise ValueError("TARGET_URL_INVALID")
         if self._settings is not None and self._settings.allowed_hosts:
             if url.host not in self._settings.allowed_hosts:
                 raise ValueError("HOST_NOT_ALLOWED")
         current_addresses = resolve_host_addresses(url.host)
         if any(_is_blocked_ip(address) for address in current_addresses):
             raise ValueError("SSRF_ADDRESS_BLOCKED")
-        if set(current_addresses) != set(self._registration_addresses):
-            if any(_is_blocked_ip(address) for address in current_addresses):
-                raise ValueError("SSRF_ADDRESS_BLOCKED")
+        if registration_addresses is not None and set(current_addresses) != set(registration_addresses):
             raise ValueError("SSRF_DNS_REBINDING_DETECTED")
 
     def _build_outcome(self, response: httpx.Response, *, body_bytes: bytes, elapsed_ms: int = 0) -> OutboundOutcome:
@@ -541,6 +555,12 @@ class ConnectorRegistry:
                 raise ValueError("SSRF_ADDRESS_BLOCKED")
             snapshot.spec = deepcopy(snapshot.spec)
             snapshot.spec["x-openapi-to-mcp-registration-hosts"] = registration_addresses
+            oauth_registration_addresses = _resolve_oauth_registration_addresses(
+                snapshot.spec,
+                self._settings,
+            )
+            if oauth_registration_addresses:
+                snapshot.spec[OAUTH_REGISTRATION_HOSTS_EXTENSION] = oauth_registration_addresses
             connector = RestOpenApiConnector(
                 snapshot,
                 MappingEngine(),
@@ -598,6 +618,63 @@ class ConnectorRegistry:
 def resolve_host_addresses(host: str) -> list[str]:
     values = {record[4][0] for record in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)}
     return sorted(values)
+
+
+def _oauth_token_hosts(spec: dict[str, Any]) -> set[str]:
+    hosts: set[str] = set()
+    security_schemes = spec.get("components", {}).get("securitySchemes", {})
+    if not isinstance(security_schemes, dict):
+        return hosts
+    for scheme in security_schemes.values():
+        if not isinstance(scheme, dict) or scheme.get("type") != "oauth2":
+            continue
+        token_url = scheme.get("flows", {}).get("clientCredentials", {}).get("tokenUrl")
+        if not isinstance(token_url, str):
+            continue
+        url = httpx.URL(token_url)
+        if url.host is not None:
+            hosts.add(url.host)
+    return hosts
+
+
+def _oauth_registration_addresses(spec: dict[str, Any]) -> dict[str, list[str]]:
+    raw = spec.get(OAUTH_REGISTRATION_HOSTS_EXTENSION)
+    if isinstance(raw, dict):
+        return {
+            str(host): [str(address) for address in addresses]
+            for host, addresses in raw.items()
+            if isinstance(addresses, list)
+        }
+    return {host: resolve_host_addresses(host) for host in _oauth_token_hosts(spec)}
+
+
+def _resolve_oauth_registration_addresses(
+    spec: dict[str, Any],
+    settings: Settings,
+) -> dict[str, list[str]]:
+    addresses_by_host: dict[str, list[str]] = {}
+    security_schemes = spec.get("components", {}).get("securitySchemes", {})
+    if not isinstance(security_schemes, dict):
+        return addresses_by_host
+    for scheme in security_schemes.values():
+        if not isinstance(scheme, dict) or scheme.get("type") != "oauth2":
+            continue
+        token_url = scheme.get("flows", {}).get("clientCredentials", {}).get("tokenUrl")
+        if not isinstance(token_url, str):
+            continue
+        url = httpx.URL(token_url)
+        if url.scheme not in {"http", "https"} or url.host is None:
+            raise ValueError("OAUTH_TOKEN_URL_INVALID")
+        if settings.allowed_hosts and url.host not in settings.allowed_hosts:
+            raise ValueError("HOST_NOT_ALLOWED")
+        try:
+            addresses = resolve_host_addresses(url.host)
+        except OSError:
+            raise ValueError("HOST_RESOLUTION_FAILED") from None
+        if any(_is_blocked_ip(address) for address in addresses):
+            raise ValueError("SSRF_ADDRESS_BLOCKED")
+        addresses_by_host[url.host] = addresses
+    return addresses_by_host
 
 
 def _elapsed_ms(start: float) -> int:

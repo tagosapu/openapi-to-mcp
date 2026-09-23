@@ -1840,6 +1840,7 @@ def _normalize_connector_payload(value: dict[str, Any]) -> dict[str, Any]:
     spec = normalized.get("spec")
     if isinstance(spec, dict):
         spec.pop("x-openapi-to-mcp-registration-hosts", None)
+        spec.pop("x-openapi-to-mcp-registration-oauth-hosts", None)
     return normalized
 
 
