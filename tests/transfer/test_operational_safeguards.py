@@ -229,6 +229,37 @@ async def test_audit_retention_keeps_tenant_specific_checkpoints(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_audit_chain_verifier_checks_checkpoint_anchor_and_event_hash(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTransferStore(tmp_path / "audit-verify.sqlite3", protector=_fernet_protector())
+    await store.initialize()
+    try:
+        transfer_id = await _seed_transfer(store, "tenant-a")
+        assert await store.verify_audit_chain("tenant-a") is True
+
+        await store.purge_expired_audit_events(datetime.now(UTC) + timedelta(days=1))
+        await store.transition(
+            "tenant-a",
+            transfer_id,
+            TransferStatus.ACCEPTED,
+            TransferStatus.VALIDATING,
+            {"classification": "validation"},
+        )
+        assert await store.verify_audit_chain("tenant-a") is True
+
+        connection = store._require_connection()
+        await connection.execute(
+            "UPDATE transfer_events SET event_hash = ? WHERE tenant_id = ?",
+            ("tampered", "tenant-a"),
+        )
+        await connection.commit()
+        assert await store.verify_audit_chain("tenant-a") is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_app_refuses_to_start_without_data_encryption_key(tmp_path: Path) -> None:
     settings = settings_factory(
         database_path=str(tmp_path / "missing-key.sqlite3"),

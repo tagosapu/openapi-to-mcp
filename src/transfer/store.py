@@ -237,6 +237,8 @@ class TransferStore(Protocol):
         self, tenant_id: str | None = None
     ) -> dict[str, Any] | None: ...
 
+    async def verify_audit_chain(self, tenant_id: str | None = None) -> bool: ...
+
 
 class SqliteTransferStore:
     def __init__(
@@ -1332,6 +1334,47 @@ class SqliteTransferStore:
             return None
         return dict(row)
 
+    async def verify_audit_chain(self, tenant_id: str | None = None) -> bool:
+        connection = self._require_connection()
+        tenants = (
+            [tenant_id]
+            if tenant_id is not None
+            else await self._list_audit_tenants(connection)
+        )
+        for tenant in tenants:
+            cursor = await connection.execute(
+                """
+                SELECT * FROM transfer_events
+                WHERE tenant_id = ?
+                ORDER BY event_order ASC
+                """,
+                (tenant,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            if not rows:
+                continue
+            previous_hash = await self._latest_checkpoint_hash(connection, tenant)
+            for row in rows:
+                if row["previous_event_hash"] != previous_hash:
+                    return False
+                expected_hash = _event_hash(
+                    previous_hash=previous_hash,
+                    event_order=int(row["event_order"]),
+                    event_id=row["event_id"],
+                    tenant_id=row["tenant_id"],
+                    transfer_id=row["transfer_id"],
+                    from_status=row["from_status"] or "",
+                    to_status=row["to_status"],
+                    event_type=row["event_type"],
+                    detail_json=row["detail_json"],
+                    created_at=row["created_at"],
+                )
+                if row["event_hash"] != expected_hash:
+                    return False
+                previous_hash = row["event_hash"]
+        return True
+
     def _require_connection(self) -> aiosqlite.Connection:
         if self._connection is None:
             raise RuntimeError("store is not initialized")
@@ -1577,6 +1620,19 @@ class SqliteTransferStore:
 
     async def _list_event_tenants(self, connection: aiosqlite.Connection) -> list[str]:
         cursor = await connection.execute("SELECT DISTINCT tenant_id FROM transfer_events")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [row["tenant_id"] for row in rows]
+
+    async def _list_audit_tenants(self, connection: aiosqlite.Connection) -> list[str]:
+        cursor = await connection.execute(
+            """
+            SELECT tenant_id FROM transfer_events
+            UNION
+            SELECT tenant_id FROM audit_chain_checkpoints
+            ORDER BY tenant_id ASC
+            """
+        )
         rows = await cursor.fetchall()
         await cursor.close()
         return [row["tenant_id"] for row in rows]
