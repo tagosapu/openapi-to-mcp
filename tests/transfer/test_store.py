@@ -87,6 +87,27 @@ async def test_store_keeps_connector_mapping_review_and_events_tenant_scoped(sto
 
 
 @pytest.mark.asyncio
+async def test_save_mapping_keeps_same_version_immutable(store) -> None:
+    from src.transfer.models import MappingDefinition
+
+    mapping = sample_mapping()
+    await store.save_mapping(MappingDefinition.model_validate(mapping), tenant_id="tenant-a")
+    await store.save_mapping(MappingDefinition.model_validate(mapping), tenant_id="tenant-a")
+
+    changed = dict(mapping)
+    changed["status"] = "deprecated"
+    with pytest.raises(ValueError, match="MAPPING_VERSION_IMMUTABLE"):
+        await store.save_mapping(
+            MappingDefinition.model_validate(changed),
+            tenant_id="tenant-a",
+        )
+
+    stored = await store.get_mapping("tenant-a", mapping["mapping_id"], mapping["version"])
+    assert stored is not None
+    assert stored.status == "published"
+
+
+@pytest.mark.asyncio
 async def test_create_or_get_transfer_is_tenant_scoped_and_detects_hash_conflict(store) -> None:
     from src.transfer.errors import IdempotencyConflict
     from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest

@@ -446,26 +446,40 @@ class SqliteTransferStore:
     async def save_mapping(self, mapping: MappingDefinition, tenant_id: str) -> None:
         connection = self._require_connection()
         now = _utc_now()
+        payload = _json_dumps(mapping.model_dump(mode="json"))
         await connection.execute(
             """
             INSERT INTO mappings (
                 mapping_id, tenant_id, version, definition_json, status, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (tenant_id, mapping_id, version) DO UPDATE SET
-                definition_json = excluded.definition_json,
-                status = excluded.status,
-                updated_at = excluded.updated_at
+            ON CONFLICT (tenant_id, mapping_id, version) DO NOTHING
             """,
             (
                 mapping.mapping_id,
                 tenant_id,
                 mapping.version,
-                _json_dumps(mapping.model_dump(mode="json")),
+                payload,
                 mapping.status,
                 _isoformat(now),
                 _isoformat(now),
             ),
         )
+        cursor = await connection.execute(
+            """
+            SELECT definition_json FROM mappings
+            WHERE tenant_id = ? AND mapping_id = ? AND version = ?
+            LIMIT 1
+            """,
+            (tenant_id, mapping.mapping_id, mapping.version),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        if existing is None:
+            await connection.rollback()
+            raise RuntimeError("mapping insert did not persist")
+        if json.loads(existing["definition_json"]) != json.loads(payload):
+            await connection.rollback()
+            raise ValueError("MAPPING_VERSION_IMMUTABLE")
         await connection.commit()
 
     async def get_mapping(
