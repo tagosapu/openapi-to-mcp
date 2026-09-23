@@ -78,6 +78,44 @@ def _success_statuses(operation: dict[str, Any]) -> set[str]:
     }
 
 
+def _operation_parameters(
+    document: dict[str, Any], path: str, method: str
+) -> tuple[Any, ...]:
+    path_item = document.get("paths", {}).get(path, {})
+    parameters = [
+        *path_item.get("parameters", []),
+        *path_item.get(method, {}).get("parameters", []),
+    ]
+    normalized = []
+    for parameter in parameters:
+        resolved = parameter
+        if isinstance(parameter, dict) and isinstance(parameter.get("$ref"), str):
+            resolved = _resolve_schema_reference(parameter["$ref"], document)
+        if not isinstance(resolved, dict):
+            normalized.append(("invalid", repr(parameter)))
+            continue
+        normalized.append(
+            (
+                resolved.get("name"),
+                resolved.get("in"),
+                bool(resolved.get("required", False)),
+                _schema_semantics(resolved.get("schema", {}), document),
+            )
+        )
+    return tuple(sorted(normalized, key=repr))
+
+
+def _request_body_media_types(operation: dict[str, Any]) -> tuple[bool, tuple[str, ...]]:
+    request_body = operation.get("requestBody") or {}
+    content = request_body.get("content") or {}
+    return bool(request_body.get("required", False)), tuple(sorted(content))
+
+
+def _response_media_types(operation: dict[str, Any], status: str) -> tuple[str, ...]:
+    response = operation.get("responses", {}).get(status, {})
+    return tuple(sorted((response.get("content") or {}).keys()))
+
+
 def _schema_shape(schema: dict[str, Any]) -> tuple[set[str], set[str], Any, Any]:
     return (
         set(schema.get("properties", {})),
@@ -252,14 +290,30 @@ def contract_differences(
                 )
             if _security(canonical_operation) != _security(generated_operation):
                 differences.append(f"security mismatch for {method.upper()} {path}")
-            missing_success = _success_statuses(canonical_operation) - _success_statuses(
-                generated_operation
-            )
-            if missing_success:
+            canonical_parameters = _operation_parameters(canonical_openapi, path, method)
+            generated_parameters = _operation_parameters(generated_openapi, path, method)
+            if canonical_parameters != generated_parameters:
+                differences.append(f"parameters mismatch for {method.upper()} {path}")
+
+            canonical_body = _request_body_media_types(canonical_operation)
+            generated_body = _request_body_media_types(generated_operation)
+            if canonical_body != generated_body:
+                differences.append(f"request body mismatch for {method.upper()} {path}")
+
+            canonical_success = _success_statuses(canonical_operation)
+            generated_success = _success_statuses(generated_operation)
+            if canonical_success != generated_success:
                 differences.append(
                     f"success response mismatch for {method.upper()} {path}: "
-                    f"missing {sorted(missing_success)}"
+                    f"canonical={sorted(canonical_success)}, generated={sorted(generated_success)}"
                 )
+            for status in sorted(canonical_success & generated_success):
+                if _response_media_types(canonical_operation, status) != _response_media_types(
+                    generated_operation, status
+                ):
+                    differences.append(
+                        f"response media type mismatch for {method.upper()} {path} {status}"
+                    )
 
     for name, canonical_schema, generated_schema in (
         ("TransferRequest", canonical_ocr, generated_ocr),

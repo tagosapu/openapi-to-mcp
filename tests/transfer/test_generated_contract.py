@@ -52,3 +52,30 @@ def test_generated_contract_detects_nested_schema_drift(tmp_path) -> None:
     )
 
     assert "nested schema semantics mismatch for TransferRequest" in differences
+
+
+def test_generated_contract_detects_operation_metadata_drift(tmp_path) -> None:
+    documented = load_yaml("docs/api/ocr-transfer-openapi.yaml")
+    generated = create_app(
+        settings_factory(database_path=str(tmp_path / "contract.sqlite3"))
+    ).openapi()
+    documented["paths"]["/v1/transfers"]["post"]["parameters"][0]["schema"]["minLength"] = 2
+    documented["paths"]["/v1/transfers"]["post"]["requestBody"]["content"] = {
+        "application/problem+json": {}
+    }
+    documented["paths"]["/v1/transfers"]["post"]["responses"]["202"]["content"] = {
+        "application/problem+json": {}
+    }
+
+    differences = contract_differences(
+        documented,
+        generated,
+        load_json("schemas/ocr-transfer-v1.json"),
+        TransferRequest.model_json_schema(),
+        load_json("schemas/mapping-v1.json"),
+        MappingDefinition.model_json_schema(),
+    )
+
+    assert "parameters mismatch for POST /v1/transfers" in differences
+    assert "request body mismatch for POST /v1/transfers" in differences
+    assert "response media type mismatch for POST /v1/transfers 202" in differences

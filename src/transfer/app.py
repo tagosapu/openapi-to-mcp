@@ -14,9 +14,22 @@ from fastapi.openapi.utils import get_openapi
 from .auth import EnvironmentCredentialResolver, JwtAuthorizer
 from .limits import PayloadLimits, RateLimiter
 from .mapping import MappingEngine
+from .models import (
+    ConnectorCreateRequest,
+    MappingDefinition,
+    ReconciliationEvidence,
+    TransferRequest,
+)
 from .observability import TransferObservability
 from .rest_connector import ConnectorRegistry
-from .routes import create_router, current_principal, install_exception_handlers
+from .routes import (
+    _ConnectorValidationRequest,
+    _MappingPreviewRequest,
+    _ReviewRequest,
+    create_router,
+    current_principal,
+    install_exception_handlers,
+)
 from .settings import TransferSettings as Settings
 from .store import SqliteTransferStore, create_payload_protector
 from .worker import RetryPolicy, TransferWorker
@@ -122,6 +135,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             routes=app.routes,
         )
         schema["openapi"] = "3.1.0"
+        _add_body_model_schemas(schema)
         schema.setdefault("components", {})["securitySchemes"] = {
             "OAuth2": {
                 "type": "oauth2",
@@ -152,6 +166,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.openapi = custom_openapi  # type: ignore[method-assign]
     return app
+
+
+def _add_body_model_schemas(schema: dict[str, Any]) -> None:
+    body_models = {
+        "TransferRequest": TransferRequest,
+        "ReviewRequest": _ReviewRequest,
+        "ReconcileRequest": ReconciliationEvidence,
+        "MappingPreviewRequest": _MappingPreviewRequest,
+        "ConnectorDefinition": ConnectorCreateRequest,
+        "ConnectorValidationRequest": _ConnectorValidationRequest,
+        "MappingDefinition": MappingDefinition,
+    }
+    components = schema.setdefault("components", {}).setdefault("schemas", {})
+    for name, model in body_models.items():
+        model_schema = model.model_json_schema(
+            ref_template="#/components/schemas/{model}"
+        )
+        definitions = model_schema.pop("$defs", {})
+        for definition_name, definition in definitions.items():
+            components.setdefault(definition_name, definition)
+        components[name] = model_schema
 
 
 def main() -> None:

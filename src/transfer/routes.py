@@ -136,7 +136,35 @@ def require_scope(scope: str) -> Callable[..., Any]:
 def create_router() -> APIRouter:
     router = APIRouter()
 
-    @router.post("/v1/transfers", name="create_transfer", status_code=202)
+    @router.post(
+        "/v1/transfers",
+        name="create_transfer",
+        status_code=202,
+        openapi_extra={
+            "parameters": [
+                {
+                    "name": "Idempotency-Key",
+                    "in": "header",
+                    "required": True,
+                    "schema": {"type": "string", "minLength": 1, "maxLength": 256},
+                },
+                {
+                    "name": "X-Correlation-ID",
+                    "in": "header",
+                    "required": False,
+                    "schema": {"type": "string", "minLength": 1},
+                },
+            ],
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/TransferRequest"}
+                    }
+                },
+            },
+        },
+    )
     async def create_transfer(
         request: Request,
         principal: Principal = Depends(require_scope("transfer:write")),
@@ -258,7 +286,20 @@ def create_router() -> APIRouter:
             raise _api_error_from_exception(exc) from exc
         return JSONResponse(status_code=202, content=_action_response(record, "cancellation accepted"))
 
-    @router.post("/v1/transfers/{transfer_id}/review", name="review_transfer")
+    @router.post(
+        "/v1/transfers/{transfer_id}/review",
+        name="review_transfer",
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ReviewRequest"}
+                    }
+                },
+            }
+        },
+    )
     async def review_transfer(
         transfer_id: str,
         request: Request,
@@ -279,7 +320,20 @@ def create_router() -> APIRouter:
             raise _api_error_from_exception(exc) from exc
         return _detail_response(request, record)
 
-    @router.post("/v1/transfers/{transfer_id}/reconcile", name="reconcile_transfer")
+    @router.post(
+        "/v1/transfers/{transfer_id}/reconcile",
+        name="reconcile_transfer",
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ReconcileRequest"}
+                    }
+                },
+            }
+        },
+    )
     async def reconcile_transfer(
         transfer_id: str,
         request: Request,
@@ -297,7 +351,20 @@ def create_router() -> APIRouter:
             raise _api_error_from_exception(exc) from exc
         return _detail_response(request, record)
 
-    @router.post("/v1/mappings/{mapping_id}/preview", name="preview_mapping")
+    @router.post(
+        "/v1/mappings/{mapping_id}/preview",
+        name="preview_mapping",
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/MappingPreviewRequest"}
+                    }
+                },
+            }
+        },
+    )
     async def preview_mapping(
         mapping_id: str,
         request: Request,
@@ -370,7 +437,21 @@ def create_router() -> APIRouter:
         connectors = await _store(request).list_connectors(principal.tenant_id)
         return {"items": [_connector_summary(connector) for connector in connectors]}
 
-    @router.post("/v1/connectors", name="create_connector", status_code=201)
+    @router.post(
+        "/v1/connectors",
+        name="create_connector",
+        status_code=201,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ConnectorDefinition"}
+                    }
+                },
+            }
+        },
+    )
     async def create_connector(
         request: Request,
         principal: Principal = Depends(require_scope("connector:admin")),
@@ -395,7 +476,21 @@ def create_router() -> APIRouter:
             raise ApiError(500, "INTERNAL_ERROR", "connector registration failed")
         return JSONResponse(status_code=201, content=_connector_registered_response(stored))
 
-    @router.post("/v1/connectors/{connector_id}/validate", name="validate_connector", status_code=202)
+    @router.post(
+        "/v1/connectors/{connector_id}/validate",
+        name="validate_connector",
+        status_code=202,
+        openapi_extra={
+            "requestBody": {
+                "required": False,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ConnectorValidationRequest"}
+                    }
+                },
+            }
+        },
+    )
     async def validate_connector(
         connector_id: str,
         request: Request,
@@ -435,7 +530,21 @@ def create_router() -> APIRouter:
         mappings = await _store(request).list_mappings(principal.tenant_id)
         return {"items": [_mapping_summary(mapping) for mapping in mappings]}
 
-    @router.post("/v1/mappings", name="create_mapping", status_code=201)
+    @router.post(
+        "/v1/mappings",
+        name="create_mapping",
+        status_code=201,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/MappingDefinition"}
+                    }
+                },
+            }
+        },
+    )
     async def create_mapping(
         request: Request,
         principal: Principal = Depends(require_scope("mapping:write")),
