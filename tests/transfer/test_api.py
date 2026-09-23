@@ -34,8 +34,13 @@ def test_settings(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
         allowed_hosts=["api.example.com", "localhost", "testserver"],
         credentials_json=json.dumps(
             {
-                "connector-test": "vault://connectors/connector-test",
-                "key://tests/transfer": encryption_key,
+                "tenants": {
+                    "tenant-a": {
+                        "vault://connectors/connector-test": {"token": "connector-token"},
+                        "config://headers/x-api-version": {"value": "2026-09-18"},
+                    }
+                },
+                "global": {"key://tests/transfer": encryption_key},
             }
         ),
     )

@@ -265,10 +265,16 @@ TRANSFER_WORKER_POLL_SECONDS=1
 TRANSFER_REQUESTS_PER_MINUTE=120
 TRANSFER_BURST=20
 TRANSFER_DATA_ENCRYPTION_KEY_REF=key://transfer/data
-TRANSFER_CREDENTIALS_JSON={"vault://connectors/invoice-target":{"auth":"REPLACE_WITH_TARGET_SECRET"},"config://headers/target-api-version":{"value":"2026-01-01"},"key://transfer/data":"REPLACE_WITH_FERNET_KEY"}
+TRANSFER_CREDENTIALS_JSON={"tenants":{"tenant-a":{"vault://connectors/invoice-target":{"auth":"REPLACE_WITH_TARGET_SECRET"},"config://headers/target-api-version":{"value":"2026-01-01"}}},"global":{"key://transfer/data":"REPLACE_WITH_FERNET_KEY"}}
 ```
 
-`TRANSFER_CREDENTIALS_JSON` is the resolver input: connector `credential_ref` values select a credential bundle, `config://...` values provide non-secret connector headers, and the `key://...` entry supplies the Fernet key referenced by `TRANSFER_DATA_ENCRYPTION_KEY_REF`. Keep the replacement values in a protected environment or secret manager. The retention settings in `env.example` control idempotency, payload, and audit retention and have defaults.
+`TRANSFER_CREDENTIALS_JSON` is the resolver input: connector `credential_ref`
+values select a bundle inside the authenticated tenant, `config://...` values
+provide non-secret connector headers, and the `global` `key://...` entry supplies
+the Fernet key referenced by `TRANSFER_DATA_ENCRYPTION_KEY_REF`. Keep the
+replacement values in a protected environment or secret manager. The retention
+settings in `env.example` control idempotency, payload, and audit retention and
+have defaults.
 
 `TRANSFER_TEST_TOKEN` is a client-side variable containing an already-issued JWT, not a token that the service creates. The JWT must contain `iss`, `aud`, `exp`, `sub`, and `tenant_id` claims; `tenant_id` must match the transfer metadata, and `sub` identifies the caller. The setup and transfer commands below need `connector:admin`, `connector:read`, `mapping:write`, `mapping:read`, `transfer:write`, and `transfer:read` scopes. Reconciliation commands additionally need `transfer:reconcile`.
 

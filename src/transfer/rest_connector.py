@@ -49,12 +49,14 @@ class RestOpenApiConnector:
         http_client: httpx.AsyncClient,
         *,
         settings: Settings | None = None,
+        tenant_id: str | None = None,
     ) -> None:
         self._definition = definition
         self._mapping_engine = mapping_engine
         self._credential_resolver = credential_resolver
         self._http_client = http_client
         self._settings = settings
+        self._tenant_id = tenant_id
         self._preflight = ContractPreflight().run(definition.spec)
         self._last_operation_id: str | None = None
         self._oauth_tokens: dict[tuple[str, str], _OAuthToken] = {}
@@ -138,7 +140,7 @@ class RestOpenApiConnector:
         if binding is not None and binding.idempotency_header:
             headers[binding.idempotency_header] = parts.idempotency_key
         for additional in self._definition.additional_headers:
-            bundle = await self._credential_resolver.resolve(additional.value_ref)
+            bundle = await self._resolve_credential(additional.value_ref)
             headers[additional.name] = _bundle_secret_value(bundle)
         auth_headers, auth_query = await self._build_auth(operation)
         headers.update(auth_headers)
@@ -356,7 +358,7 @@ class RestOpenApiConnector:
         if not operation.security_options:
             return {}, {}
         spec_schemes = self._definition.spec.get("components", {}).get("securitySchemes", {})
-        bundle = await self._credential_resolver.resolve(self._definition.credential_ref)
+        bundle = await self._resolve_credential(self._definition.credential_ref)
         unavailable: _SecurityOptionUnavailable | None = None
         for option in operation.security_options:
             try:
@@ -366,6 +368,15 @@ class RestOpenApiConnector:
         if unavailable is not None:
             raise ValueError("AUTHENTICATION_OPTION_UNAVAILABLE") from unavailable
         raise ValueError("AUTHENTICATION_OPTION_UNAVAILABLE")
+
+    async def _resolve_credential(self, credential_ref: str) -> SecretBundle:
+        if self._tenant_id is None:
+            return await self._credential_resolver.resolve(credential_ref)
+        return await _resolve_for_tenant(
+            self._credential_resolver,
+            self._tenant_id,
+            credential_ref,
+        )
 
     async def _build_auth_option(
         self,
@@ -597,12 +608,24 @@ class ConnectorRegistry:
             )
             if oauth_registration_addresses:
                 snapshot.spec[OAUTH_REGISTRATION_HOSTS_EXTENSION] = oauth_registration_addresses
+            await _resolve_for_tenant(
+                self._credential_resolver,
+                tenant_id,
+                snapshot.credential_ref,
+            )
+            for additional in snapshot.additional_headers:
+                await _resolve_for_tenant(
+                    self._credential_resolver,
+                    tenant_id,
+                    additional.value_ref,
+                )
             connector = RestOpenApiConnector(
                 snapshot,
                 MappingEngine(),
                 self._credential_resolver,
                 client,
                 settings=self._settings,
+                tenant_id=tenant_id,
             )
             result = await connector.validate_config()
             if not result.valid:
@@ -634,6 +657,7 @@ class ConnectorRegistry:
             self._credential_resolver,
             httpx.AsyncClient(follow_redirects=False),
             settings=self._settings,
+            tenant_id=tenant_id,
         )
 
     async def validate(self, tenant_id: str, connector_id: str) -> ContractPreflightResult:
@@ -654,6 +678,17 @@ class ConnectorRegistry:
 def resolve_host_addresses(host: str) -> list[str]:
     values = {record[4][0] for record in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)}
     return sorted(values)
+
+
+async def _resolve_for_tenant(
+    resolver: CredentialResolver,
+    tenant_id: str,
+    credential_ref: str,
+) -> SecretBundle:
+    resolver_method = getattr(resolver, "resolve_for_tenant", None)
+    if not callable(resolver_method):
+        raise RuntimeError("tenant-aware credential resolver is required")
+    return await resolver_method(tenant_id, str(credential_ref))
 
 
 def _oauth_token_hosts(spec: dict[str, Any]) -> set[str]:

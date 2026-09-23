@@ -30,6 +30,9 @@ class StaticCredentialResolver:
 
         return SecretBundle.model_validate({"values": self._payloads[credential_ref]})
 
+    async def resolve_for_tenant(self, tenant_id: str, credential_ref: str):
+        return await self.resolve(credential_ref)
+
 
 def _request() -> TransferRequest:
     return TransferRequest.model_validate(sample_transfer_request())
@@ -1076,6 +1079,67 @@ async def test_registry_rejects_same_version_material_changes_but_allows_identic
             await registry.register("tenant-a", ConnectorDefinition.model_validate(changed_payload))
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_rejects_cross_tenant_credential_reference(tmp_path: Path) -> None:
+    from src.transfer.auth import EnvironmentCredentialResolver
+    from src.transfer.rest_connector import ConnectorRegistry
+    from src.transfer.store import SqliteTransferStore
+
+    settings = settings_factory(
+        allowed_hosts=["93.184.216.34"],
+        credentials_json=json.dumps(
+            {
+                "tenants": {
+                    "tenant-a": {
+                        "vault://connectors/connector-test": {"token": "tenant-a-token"},
+                        "config://headers/x-api-version": {"value": "2026-09-18"},
+                    }
+                }
+            }
+        ),
+    )
+    store = SqliteTransferStore(tmp_path / "registry-tenant-credentials.sqlite3", allow_legacy_plaintext=True)
+    await store.initialize()
+    try:
+        registry = ConnectorRegistry(store, EnvironmentCredentialResolver(settings), settings)
+        definition = _definition(_base_spec({"type": "http", "scheme": "bearer"}))
+
+        await registry.register("tenant-a", definition)
+        with pytest.raises(RuntimeError, match="credential ref not found for tenant"):
+            await registry.register("tenant-b", definition)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_environment_credentials_are_tenant_scoped() -> None:
+    from src.transfer.auth import EnvironmentCredentialResolver
+
+    settings = settings_factory(
+        credentials_json=json.dumps(
+            {
+                "tenants": {
+                    "tenant-a": {
+                        "vault://connectors/connector-test": {"token": "tenant-a-token"},
+                    }
+                },
+                "global": {"key://transfer/data": {"value": "global-key"}},
+            }
+        )
+    )
+    resolver = EnvironmentCredentialResolver(settings)
+
+    bundle = await resolver.resolve_for_tenant(
+        "tenant-a",
+        "vault://connectors/connector-test",
+    )
+    assert bundle.values["token"].get_secret_value() == "tenant-a-token"
+    with pytest.raises(RuntimeError, match="credential ref not found for tenant"):
+        await resolver.resolve_for_tenant("tenant-b", "vault://connectors/connector-test")
+    global_bundle = await resolver.resolve("key://transfer/data")
+    assert global_bundle.values["value"].get_secret_value() == "global-key"
 
 
 @pytest.mark.asyncio
