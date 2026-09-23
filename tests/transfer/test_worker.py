@@ -815,6 +815,63 @@ async def test_worker_received_response_requires_registered_postcondition(
 
 
 @pytest.mark.asyncio
+async def test_worker_succeeds_path_bound_update_without_postcondition(store, monkeypatch) -> None:
+    connector_payload = sample_connector_definition()
+    connector_payload["operation_bindings"] = {
+        "update": {
+            "operation_id": "updateInvoice",
+            "idempotency_header": "Idempotency-Key",
+        }
+    }
+    connector_definition = ConnectorDefinition.model_validate(connector_payload)
+    mapping_payload = sample_mapping()
+    mapping_payload["operations"] = ["update"]
+    mapping_definition = MappingDefinition.model_validate(mapping_payload)
+    await _save_prereqs(
+        store,
+        connectors=[connector_definition],
+        mappings=[mapping_definition],
+    )
+
+    request_payload = _request_payload("update-no-postcondition")
+    request_payload["delivery"]["operation"] = "update"
+    connector = FakeConnector(
+        operation=OperationSelection(
+            name="update",
+            operation_id="updateInvoice",
+            method="PATCH",
+            path="/invoices/{invoiceId}",
+        ),
+        outcome=OutboundOutcome(
+            delivery_state="received",
+            status_code=204,
+            headers={},
+            body=None,
+            request_id="req-update",
+            elapsed_ms=9,
+        ),
+    )
+    registry = FakeRegistry({("tenant-a", "connector-test", 7): connector})
+    worker = TransferWorker(store, registry, MappingEngine(), RetryPolicy(jitter_ratio=0.0))
+    transfer_id = await _seed_transfer(
+        store,
+        suffix="update-no-postcondition",
+        status=TransferStatus.QUEUED,
+        request_payload=request_payload,
+    )
+    monkeypatch.setattr("src.transfer.worker._utc_now", lambda: FIXED_NOW)
+
+    await worker.run_once()
+
+    record = await store.get_transfer("tenant-a", transfer_id)
+    assert record is not None
+    assert record.status == TransferStatus.SUCCEEDED, record.error.model_dump() if record.error else None
+    assert record.result is not None
+    assert record.result.postcondition_verified is False
+    assert connector.reconcile_contexts == []
+
+
+@pytest.mark.asyncio
 async def test_worker_recovers_inflight_states_on_restart(store) -> None:
     await _save_prereqs(store)
     validating_id = await _seed_transfer(store, suffix="recover-validating", status=TransferStatus.VALIDATING)

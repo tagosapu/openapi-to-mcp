@@ -621,7 +621,11 @@ class TransferWorker:
 
         try:
             parsed = loaded.connector.parse_response(outcome)
-            target_resource_id = _validated_target_resource_id(parsed)
+            binding = loaded.connector_definition.operation_bindings.get(loaded.operation.name)
+            if loaded.operation.name == "update" and binding is not None and binding.postcondition is None:
+                target_resource_id = _optional_target_resource_id(parsed)
+            else:
+                target_resource_id = _validated_target_resource_id(parsed)
         except Exception as exc:
             await self._store.transition_state(
                 record.tenant_id,
@@ -636,6 +640,19 @@ class TransferWorker:
                     retryable=False,
                     correlation_id=record.correlation_id,
                 ),
+            )
+            return
+
+        binding = loaded.connector_definition.operation_bindings.get(loaded.operation.name)
+        if loaded.operation.name == "update" and binding is not None and binding.postcondition is None:
+            parsed.completed_at = _utc_now()
+            await self._store.transition_state(
+                record.tenant_id,
+                record.transfer_id,
+                expected,
+                TransferStatus.SUCCEEDED,
+                detail,
+                result=parsed,
             )
             return
 
