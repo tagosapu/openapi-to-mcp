@@ -22,6 +22,7 @@ from .errors import (
     InvalidTransitionError,
     MappingValidationError,
     NotFoundError,
+    PayloadLimitError,
     TenantIsolationError,
 )
 from .limits import RateLimitDecision
@@ -44,6 +45,7 @@ from .models import (
     TransferStatus,
 )
 from .openapi_contract import ContractPreflight, public_spec_hash
+from .observability import SecretRedactor
 from .store import TransferStore, encode_transfer_cursor
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -142,6 +144,13 @@ def create_router() -> APIRouter:
     ) -> JSONResponse:
         _check_rate_limit(request, principal)
         payload = _parse_model(TransferRequest, body)
+        try:
+            _payload_limits(request).validate(payload)
+        except PayloadLimitError as exc:
+            raise _api_error_from_exception(
+                exc,
+                correlation_id=payload.metadata.correlation_id,
+            ) from exc
         _require_tenant(principal, payload.metadata.tenant_id)
         idempotency_key = request.headers.get("Idempotency-Key", "")
         if not 1 <= len(idempotency_key) <= 256:
@@ -164,6 +173,12 @@ def create_router() -> APIRouter:
             )
         except Exception as exc:
             raise _api_error_from_exception(exc, correlation_id=payload.metadata.correlation_id) from exc
+
+        _observability(request).record_event(
+            status=created.record.status.value,
+            classification="accepted",
+            connector_id=created.record.connector_id,
+        )
 
         headers = {"X-Correlation-ID": created.record.correlation_id}
         if created.idempotent_replay:
@@ -325,6 +340,10 @@ def create_router() -> APIRouter:
             },
             metadata=preview_request.metadata,
         )
+        try:
+            _payload_limits(request).validate(payload)
+        except PayloadLimitError as exc:
+            raise _api_error_from_exception(exc) from exc
         connector: Connector | None = None
         try:
             connector, operation = await _load_connector_operation(
@@ -554,7 +573,7 @@ async def _optional_json_body(request: Request) -> dict[str, Any]:
 
 async def _read_json_body(request: Request, *, required: bool) -> dict[str, Any]:
     content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-    max_bytes = int(getattr(request.app.state.settings, "max_payload_bytes"))
+    max_bytes = _payload_limits(request).max_payload_bytes
     content_length = request.headers.get("Content-Length")
     if content_length is not None:
         try:
@@ -814,7 +833,7 @@ def _preview_response(preview: MappingPreview, issues: list[MappingIssue]) -> di
     return {
         "method": preview.method,
         "path": preview.path,
-        "headers": preview.headers,
+        "headers": SecretRedactor().headers(preview.headers),
         "query": preview.query_params,
         "body": preview.json_body if preview.json_body is not None else {},
         "validation": {
@@ -959,6 +978,13 @@ def _api_error_from_exception(exc: Exception, *, correlation_id: str | None = No
         return ApiError(404, "NOT_FOUND", "resource not found", correlation_id=correlation_id)
     if isinstance(exc, InvalidTransitionError):
         return ApiError(409, "INVALID_TRANSITION", "transfer state does not allow this action", correlation_id=correlation_id)
+    if isinstance(exc, PayloadLimitError):
+        return ApiError(
+            413,
+            "PAYLOAD_LIMIT_EXCEEDED",
+            "request payload exceeds an operational limit",
+            correlation_id=correlation_id,
+        )
     if isinstance(exc, (MappingValidationError, ValueError)):
         code = _safe_exception_code(exc)
         if code == "CONNECTOR_VERSION_IMMUTABLE":
@@ -1013,6 +1039,18 @@ def _worker(request: Request) -> Any:
 
 def _mapping_engine(request: Request) -> MappingEngine:
     return request.app.state.mapping_engine
+
+
+def _payload_limits(request: Request) -> Any:
+    limits = request.app.state.payload_limits
+    configured_max_bytes = int(request.app.state.settings.max_payload_bytes)
+    if limits.max_payload_bytes != configured_max_bytes:
+        limits.max_payload_bytes = configured_max_bytes
+    return limits
+
+
+def _observability(request: Request) -> Any:
+    return request.app.state.observability
 
 
 def _correlation_id(request: Request, fallback: str | None) -> str:

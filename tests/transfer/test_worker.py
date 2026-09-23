@@ -354,7 +354,7 @@ async def _last_transition_detail(store: SqliteTransferStore, transfer_id: str) 
 @pytest.fixture
 async def store(tmp_path):
     db_path = tmp_path / "worker.sqlite3"
-    transfer_store = SqliteTransferStore(db_path)
+    transfer_store = SqliteTransferStore(db_path, allow_legacy_plaintext=True)
     await transfer_store.initialize()
     try:
         yield transfer_store
@@ -365,7 +365,9 @@ async def store(tmp_path):
 @pytest.fixture
 async def encrypted_store(tmp_path):
     db_path = tmp_path / "worker-encrypted.sqlite3"
-    transfer_store = SqliteTransferStore(db_path, protector=PrefixProtector())
+    transfer_store = SqliteTransferStore(
+        db_path, protector=PrefixProtector(), allow_legacy_plaintext=True
+    )
     await transfer_store.initialize()
     try:
         yield transfer_store, db_path

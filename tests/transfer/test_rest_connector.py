@@ -870,7 +870,9 @@ async def test_registry_rejects_missing_reconciliation_configuration_and_invalid
         }
     }
 
-    store = SqliteTransferStore(tmp_path / "registry.sqlite3")
+    store = SqliteTransferStore(
+        tmp_path / "registry.sqlite3", allow_legacy_plaintext=True
+    )
     await store.initialize()
     try:
         registry = ConnectorRegistry(
@@ -899,7 +901,9 @@ async def test_registry_is_tenant_scoped_and_version_pinned(tmp_path: Path) -> N
     from src.transfer.rest_connector import ConnectorRegistry
     from src.transfer.store import SqliteTransferStore
 
-    store = SqliteTransferStore(tmp_path / "registry-version.sqlite3")
+    store = SqliteTransferStore(
+        tmp_path / "registry-version.sqlite3", allow_legacy_plaintext=True
+    )
     await store.initialize()
     try:
         registry = ConnectorRegistry(
@@ -948,7 +952,9 @@ async def test_registry_rejects_same_version_material_changes_but_allows_identic
     from src.transfer.rest_connector import ConnectorRegistry
     from src.transfer.store import SqliteTransferStore
 
-    store = SqliteTransferStore(tmp_path / "registry-immutability.sqlite3")
+    store = SqliteTransferStore(
+        tmp_path / "registry-immutability.sqlite3", allow_legacy_plaintext=True
+    )
     await store.initialize()
     try:
         registry = ConnectorRegistry(

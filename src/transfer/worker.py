@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import logging
 import random
+from time import perf_counter
 from typing import Any, Literal
 
 from jsonpointer import JsonPointerException, resolve_pointer
@@ -26,14 +28,17 @@ from .models import (
     TransferResult,
     TransferStatus,
 )
+from .observability import TransferObservability
 from .settings import TransferSettings as Settings
 from .store import TransferStore
 
 
 _WORKER_POLL_SECONDS = 1.0
+_MAINTENANCE_INTERVAL = timedelta(minutes=5)
 _REVIEW_ACTOR = "system"
 _RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 _REVIEWABLE_CODES = {"LOW_CONFIDENCE"}
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -65,11 +70,18 @@ class TransferWorker:
         registry: Any,
         mapping_engine: MappingEngine,
         retry_policy: RetryPolicy,
+        observability: TransferObservability | None = None,
+        payload_retention_days: int | None = None,
+        audit_retention_days: int | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
         self._mapping_engine = mapping_engine
         self._retry_policy = retry_policy
+        self._observability = observability or TransferObservability()
+        self._payload_retention_days = payload_retention_days
+        self._audit_retention_days = audit_retention_days
+        self._last_maintenance_at: datetime | None = None
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -78,18 +90,53 @@ class TransferWorker:
         if claim is None:
             return False
 
-        if claim.phase == "validate":
-            await self._handle_validate_claim(claim.record)
-            return True
-
-        await self._handle_deliver_claim(claim.record)
+        phase = "validation" if claim.phase == "validate" else "delivery"
+        started = perf_counter()
+        try:
+            with self._observability.span(
+                f"transfer.{phase}",
+                status=claim.record.status.value,
+                connector_id=claim.record.connector_id,
+            ):
+                if claim.phase == "validate":
+                    await self._handle_validate_claim(claim.record)
+                else:
+                    await self._handle_deliver_claim(claim.record)
+        finally:
+            self._observability.record_event(
+                status=claim.record.status.value,
+                classification=claim.phase,
+                connector_id=claim.record.connector_id,
+                duration_ms=int((perf_counter() - started) * 1000),
+            )
         return True
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
             return
+        await self.run_maintenance()
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop())
+
+    async def run_maintenance(self) -> None:
+        now = _utc_now()
+        if (
+            self._last_maintenance_at is not None
+            and now - self._last_maintenance_at < _MAINTENANCE_INTERVAL
+        ):
+            return
+        purge_idempotency = getattr(self._store, "purge_expired_idempotency_keys", None)
+        if purge_idempotency is not None:
+            await purge_idempotency(now)
+        if self._payload_retention_days is not None:
+            await self._store.purge_expired_payloads(
+                now - timedelta(days=self._payload_retention_days)
+            )
+        if self._audit_retention_days is not None:
+            await self._store.purge_expired_audit_events(
+                now - timedelta(days=self._audit_retention_days)
+            )
+        self._last_maintenance_at = now
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -233,19 +280,24 @@ class TransferWorker:
 
         loaded = await self._load_context(record)
         try:
-            result = await loaded.connector.reconcile(
-                ReconciliationContext(
-                    transfer_id=record.transfer_id,
-                    idempotency_key=record.idempotency_key,
-                    deduplication_value=_canonical_deduplication_value(
-                        loaded.effective_payload,
-                        loaded.mapping.deduplication_key_path,
-                    ),
-                    operation_id=loaded.operation.operation_id,
-                    mode="unknown",
-                    target_resource_id=_optional_target_resource_id(record.result),
+            with self._observability.span(
+                "transfer.reconciliation",
+                status=record.status.value,
+                connector_id=record.connector_id,
+            ):
+                result = await loaded.connector.reconcile(
+                    ReconciliationContext(
+                        transfer_id=record.transfer_id,
+                        idempotency_key=record.idempotency_key,
+                        deduplication_value=_canonical_deduplication_value(
+                            loaded.effective_payload,
+                            loaded.mapping.deduplication_key_path,
+                        ),
+                        operation_id=loaded.operation.operation_id,
+                        mode="unknown",
+                        target_resource_id=_optional_target_resource_id(record.result),
+                    )
                 )
-            )
         finally:
             await _close_connector(loaded.connector)
 
@@ -313,8 +365,21 @@ class TransferWorker:
         await self.recover_inflight()
         while not self._stop_event.is_set():
             try:
+                await self.run_maintenance()
+            except Exception as exc:
+                _LOGGER.warning(
+                    "transfer maintenance failed",
+                    extra={"error_type": type(exc).__name__},
+                )
+                await self._wait_for_poll_interval()
+                continue
+            try:
                 worked = await self.run_once()
-            except Exception:
+            except Exception as exc:
+                _LOGGER.warning(
+                    "transfer worker iteration failed",
+                    extra={"error_type": type(exc).__name__},
+                )
                 await self._wait_for_poll_interval()
                 continue
             if worked:

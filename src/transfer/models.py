@@ -4,8 +4,14 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, StringConstraints, model_validator
-
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 JsonPointer = Annotated[str, StringConstraints(pattern=r"^(?:|/(?:[^/~]|~0|~1)*)+$")]
 OpaqueObjectRef = Annotated[
@@ -15,6 +21,7 @@ ReferenceUri = Annotated[
     str,
     StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9+.-]*://[^\s]+$")]
 UnitIntervalFloat = Annotated[float, Field(ge=0.0, le=1.0)]
+NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 
 
 def _ensure_non_http_reference(value: str, field_name: str) -> str:
@@ -28,12 +35,69 @@ class TransferBaseModel(BaseModel):
 
 
 class OcrSource(TransferBaseModel):
+    model_config = ConfigDict(extra="allow")
+
     page: int | None = Field(default=None, ge=1)
     bbox: tuple[UnitIntervalFloat, UnitIntervalFloat, UnitIntervalFloat, UnitIntervalFloat] | None = None
     polygon: list[tuple[UnitIntervalFloat, UnitIntervalFloat]] | None = None
 
 
 class OcrField(TransferBaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "allOf": [
+                {
+                    "if": {"properties": {"value_type": {"const": "string"}}},
+                    "then": {"properties": {"value": {"type": "string"}}},
+                },
+                {
+                    "if": {"properties": {"value_type": {"const": "integer"}}},
+                    "then": {"properties": {"value": {"type": "integer"}}},
+                },
+                {
+                    "if": {"properties": {"value_type": {"const": "number"}}},
+                    "then": {"properties": {"value": {"type": "number"}}},
+                },
+                {
+                    "if": {"properties": {"value_type": {"const": "boolean"}}},
+                    "then": {"properties": {"value": {"type": "boolean"}}},
+                },
+                {
+                    "if": {"properties": {"value_type": {"const": "date"}}},
+                    "then": {
+                        "properties": {
+                            "value": {"type": "string", "format": "date"}
+                        }
+                    },
+                },
+                {
+                    "if": {"properties": {"value_type": {"const": "datetime"}}},
+                    "then": {
+                        "properties": {
+                            "value": {"type": "string", "format": "date-time"}
+                        }
+                    },
+                },
+                {
+                    "if": {"properties": {"value_type": {"const": "currency"}}},
+                    "then": {
+                        "required": ["value", "unit"],
+                        "properties": {"value": {"type": "number"}},
+                    },
+                },
+                {
+                    "if": {"properties": {"value_type": {"const": "object"}}},
+                    "then": {"properties": {"value": {"type": "object"}}},
+                },
+                {
+                    "if": {"properties": {"value_type": {"const": "array"}}},
+                    "then": {"properties": {"value": {"type": "array"}}},
+                },
+            ]
+        },
+    )
+
     raw_value: str | None = None
     value: Any | None = None
     value_type: Literal[
@@ -85,8 +149,8 @@ class OcrLineItem(TransferBaseModel):
 
 
 class DocumentContent(TransferBaseModel):
-    media_type: str | None = None
-    filename: str | None = None
+    media_type: str | None = Field(default=None, min_length=1)
+    filename: str | None = Field(default=None, min_length=1)
     sha256: str | None = Field(default=None, pattern=r"^sha256:[A-Fa-f0-9]{64}$")
     storage_ref: OpaqueObjectRef | None = None
 
@@ -100,7 +164,14 @@ class OcrDocument(TransferBaseModel):
 
 
 class OcrResult(TransferBaseModel):
-    languages: list[str] = Field(default_factory=list)
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "anyOf": [{"required": ["fields"]}, {"required": ["line_items"]}]
+        },
+    )
+
+    languages: list[NonEmptyString] = Field(default_factory=list)
     text_ref: OpaqueObjectRef | None = None
     fields: dict[str, OcrField] | None = None
     line_items: list[OcrLineItem] | None = None
@@ -149,8 +220,28 @@ class TransferRequest(TransferBaseModel):
 
 
 class MappingTarget(TransferBaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "allOf": [
+                {
+                    "if": {"properties": {"location": {"const": "body"}}},
+                    "then": {"required": ["pointer"], "not": {"required": ["name"]}},
+                },
+                {
+                    "if": {
+                        "properties": {
+                            "location": {"enum": ["path", "query", "header"]}
+                        }
+                    },
+                    "then": {"required": ["name"], "not": {"required": ["pointer"]}},
+                },
+            ]
+        },
+    )
+
     location: Literal["path", "query", "header", "body"]
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1)
     pointer: str | None = Field(default=None, pattern=r"^(?:|/(?:[^/~]|~0|~1)*)+$")
 
     @model_validator(mode="after")
@@ -174,9 +265,9 @@ class MappingRule(TransferBaseModel):
     rule_id: str = Field(min_length=1)
     source: JsonPointer
     target: MappingTarget
-    required: bool = False
-    on_missing: Literal["error", "omit", "null"] = "error"
-    transforms: list[str] = Field(default_factory=list)
+    required: bool
+    on_missing: Literal["error", "omit", "null"]
+    transforms: list[NonEmptyString] = Field(default_factory=list)
     default: Any | None = None
     enum_map: dict[str, str | int | float | bool] = Field(default_factory=dict)
     condition: MappingCondition | None = None
@@ -275,13 +366,13 @@ class OperationSelection(TransferBaseModel):
 class MappingDefinition(TransferBaseModel):
     mapping_id: str = Field(min_length=1)
     version: int = Field(ge=1)
-    status: Literal["draft", "published", "deprecated"]
+    status: Literal["draft", "published", "deprecated"] = "draft"
     connector_id: str = Field(min_length=1)
-    document_types: list[str] = Field(min_length=1)
+    document_types: list[NonEmptyString] = Field(min_length=1)
     operations: list[Literal["create", "update", "upsert"]] = Field(min_length=1)
     deduplication_key_path: str = Field(pattern=r"^(?:|/(?:[^/~]|~0|~1)*)+$")
     target_schema_ref: str = Field(pattern=r"^openapi:#(?:/(?:[^/~]|~0|~1)*)+$")
-    rules: list[MappingRule] = Field(default_factory=list)
+    rules: list[MappingRule]
 
 
 class ConnectorDefinition(TransferBaseModel):

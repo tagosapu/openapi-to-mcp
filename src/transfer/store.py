@@ -36,6 +36,7 @@ from .models import (
     TransferStatus,
 )
 from .openapi_contract import public_spec_hash
+from .observability import SecretRedactor
 
 
 ALLOWED_TRANSITIONS = {
@@ -226,6 +227,8 @@ class TransferStore(Protocol):
 
     async def purge_expired_payloads(self, before: datetime) -> int: ...
 
+    async def purge_expired_idempotency_keys(self, before: datetime) -> int: ...
+
     async def purge_expired_audit_events(
         self, before: datetime, tenant_id: str | None = None
     ) -> int: ...
@@ -242,9 +245,16 @@ class SqliteTransferStore:
         protector: PayloadProtector | None = None,
         *,
         idempotency_retention: timedelta | None = None,
+        allow_legacy_plaintext: bool = False,
     ) -> None:
+        if protector is None and not allow_legacy_plaintext:
+            raise RuntimeError(
+                "payload protector is required unless legacy plaintext is explicitly enabled"
+            )
         self._path = path
         self._protector = protector
+        self._allow_legacy_plaintext = allow_legacy_plaintext
+        self._redactor = SecretRedactor()
         self._connection: aiosqlite.Connection | None = None
         self._idempotency_retention = idempotency_retention or timedelta(hours=24)
 
@@ -543,6 +553,7 @@ class SqliteTransferStore:
         connection = self._require_connection()
         now = _utc_now()
         request_json = _json_dumps(request.model_dump(mode="json"))
+        stored_request_json = self._encode_json_payload(json.loads(request_json))
         request_hash = _sha256_hex(request_json)
         await connection.execute("BEGIN IMMEDIATE")
         try:
@@ -625,7 +636,7 @@ class SqliteTransferStore:
                     idempotency_key,
                     _isoformat(idempotency_expires_at),
                     request_hash,
-                    request_json,
+                    stored_request_json,
                     record.status.value,
                     record.attempt,
                     None,
@@ -1161,7 +1172,7 @@ class SqliteTransferStore:
         actor = ""
         reason = ""
         if event_row is not None:
-            detail = json.loads(event_row["detail_json"])
+            detail = self._decode_event_detail(event_row["detail_json"])
             actor = detail.get("actor", "")
             reason = detail.get("reason", "")
         return ReviewCorrection(
@@ -1172,6 +1183,46 @@ class SqliteTransferStore:
         )
 
     async def purge_expired_payloads(self, before: datetime) -> int:
+        connection = self._require_connection()
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await connection.execute(
+                """
+                SELECT tenant_id, transfer_id
+                FROM transfers
+                WHERE status IN (?, ?, ?, ?)
+                  AND completed_at IS NOT NULL
+                  AND completed_at < ?
+                """,
+                tuple(status.value for status in TERMINAL_STATUSES) + (_isoformat(before),),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                tombstone = self._encode_json_payload({"payload_purged": True})
+                await connection.execute(
+                    """
+                    UPDATE transfers
+                    SET request_json = ?, result_json = NULL, error_json = NULL
+                    WHERE tenant_id = ? AND transfer_id = ?
+                    """,
+                    (tombstone, row["tenant_id"], row["transfer_id"]),
+                )
+                await connection.execute(
+                    """
+                    UPDATE review_corrections
+                    SET correction_json = ?
+                    WHERE tenant_id = ? AND transfer_id = ?
+                    """,
+                    (tombstone, row["tenant_id"], row["transfer_id"]),
+                )
+            await connection.commit()
+            return len(rows)
+        except Exception:
+            await connection.rollback()
+            raise
+
+    async def purge_expired_idempotency_keys(self, before: datetime) -> int:
         connection = self._require_connection()
         cursor = await connection.execute(
             """
@@ -1197,45 +1248,60 @@ class SqliteTransferStore:
         tenants = [tenant_id] if tenant_id is not None else await self._list_event_tenants(connection)
         total_deleted = 0
         for tenant in tenants:
-            cursor = await connection.execute(
-                """
-                SELECT * FROM transfer_events
-                WHERE tenant_id = ? AND created_at < ?
-                ORDER BY created_at ASC, event_order ASC
-                """,
-                (tenant, _isoformat(before)),
-            )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            if not rows:
-                continue
-            last_hash = rows[-1]["event_hash"]
-            checkpoint_id = str(uuid4())
-            created_at = _utc_now()
-            checkpoint_hash = _sha256_hex(
-                "|".join([tenant, _isoformat(before), last_hash or "", _isoformat(created_at)])
-            )
-            await connection.execute(
-                """
-                INSERT INTO audit_chain_checkpoints (
-                    checkpoint_id, tenant_id, cutoff_at, deleted_through_hash, checkpoint_hash, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    checkpoint_id,
-                    tenant,
-                    _isoformat(before),
-                    last_hash,
-                    checkpoint_hash,
-                    _isoformat(created_at),
-                ),
-            )
-            await connection.execute(
-                "DELETE FROM transfer_events WHERE tenant_id = ? AND created_at < ?",
-                (tenant, _isoformat(before)),
-            )
-            total_deleted += len(rows)
-        await connection.commit()
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await connection.execute(
+                    """
+                    SELECT * FROM transfer_events
+                    WHERE tenant_id = ? AND created_at < ?
+                    ORDER BY created_at ASC, event_order ASC
+                    """,
+                    (tenant, _isoformat(before)),
+                )
+                rows = await cursor.fetchall()
+                await cursor.close()
+                if not rows:
+                    await connection.commit()
+                    continue
+                last_hash = rows[-1]["event_hash"]
+                previous_checkpoint = await self._latest_checkpoint_hash(connection, tenant)
+                checkpoint_id = str(uuid4())
+                created_at = _utc_now()
+                checkpoint_hash = _sha256_hex(
+                    _json_dumps(
+                        {
+                            "tenant_id": tenant,
+                            "cutoff_at": _isoformat(before),
+                            "deleted_through_hash": last_hash,
+                            "previous_checkpoint_hash": previous_checkpoint,
+                        }
+                    )
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO audit_chain_checkpoints (
+                        checkpoint_id, tenant_id, cutoff_at, deleted_through_hash, checkpoint_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        checkpoint_id,
+                        tenant,
+                        _isoformat(before),
+                        last_hash,
+                        checkpoint_hash,
+                        _isoformat(created_at),
+                    ),
+                )
+                await connection.execute(
+                    "DELETE FROM transfer_events WHERE tenant_id = ? AND created_at < ?",
+                    (tenant, _isoformat(before)),
+                )
+                await self._reanchor_remaining_events(connection, tenant, checkpoint_hash)
+                await connection.commit()
+                total_deleted += len(rows)
+            except Exception:
+                await connection.rollback()
+                raise
         return total_deleted
 
     async def get_latest_audit_checkpoint(
@@ -1310,8 +1376,8 @@ class SqliteTransferStore:
         elif target != TransferStatus.RETRYING:
             next_retry_value = None
 
-        existing_result = json.loads(row["result_json"]) if row["result_json"] else None
-        existing_error = json.loads(row["error_json"]) if row["error_json"] else None
+        existing_result = self._decode_json_payload(row["result_json"]) if row["result_json"] else None
+        existing_error = self._decode_json_payload(row["error_json"]) if row["error_json"] else None
         if clear_result:
             existing_result = None
         if clear_error:
@@ -1343,8 +1409,8 @@ class SqliteTransferStore:
                 target.value,
                 attempt,
                 next_retry_value,
-                _json_dumps(existing_result) if existing_result is not None else None,
-                _json_dumps(existing_error) if existing_error is not None else None,
+                self._encode_json_payload(existing_result) if existing_result is not None else None,
+                self._encode_json_payload(existing_error) if existing_error is not None else None,
                 _isoformat(now),
                 completed_at,
                 row["tenant_id"],
@@ -1388,22 +1454,18 @@ class SqliteTransferStore:
         event_order = await self._next_event_order(connection, tenant_id)
         previous_hash = await self._latest_event_hash(connection, tenant_id)
         event_id = str(uuid4())
-        detail_json = _json_dumps(detail)
-        event_hash = _sha256_hex(
-            "|".join(
-                [
-                    previous_hash or "",
-                    str(event_order),
-                    event_id,
-                    tenant_id,
-                    transfer_id,
-                    from_status.value if from_status is not None else "",
-                    to_status.value,
-                    event_type,
-                    detail_json,
-                    _isoformat(created_at),
-                ]
-            )
+        detail_json = self._encode_event_detail(detail)
+        event_hash = _event_hash(
+            previous_hash=previous_hash,
+            event_order=event_order,
+            event_id=event_id,
+            tenant_id=tenant_id,
+            transfer_id=transfer_id,
+            from_status=from_status.value if from_status is not None else "",
+            to_status=to_status.value,
+            event_type=event_type,
+            detail_json=detail_json,
+            created_at=_isoformat(created_at),
         )
         await connection.execute(
             """
@@ -1427,6 +1489,46 @@ class SqliteTransferStore:
                 _isoformat(created_at),
             ),
         )
+
+    async def _reanchor_remaining_events(
+        self,
+        connection: aiosqlite.Connection,
+        tenant_id: str,
+        checkpoint_hash: str,
+    ) -> None:
+        cursor = await connection.execute(
+            """
+            SELECT * FROM transfer_events
+            WHERE tenant_id = ?
+            ORDER BY event_order ASC
+            """,
+            (tenant_id,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        previous_hash: str | None = checkpoint_hash
+        for row in rows:
+            event_hash = _event_hash(
+                previous_hash=previous_hash,
+                event_order=int(row["event_order"]),
+                event_id=row["event_id"],
+                tenant_id=row["tenant_id"],
+                transfer_id=row["transfer_id"],
+                from_status=row["from_status"] or "",
+                to_status=row["to_status"],
+                event_type=row["event_type"],
+                detail_json=row["detail_json"],
+                created_at=row["created_at"],
+            )
+            await connection.execute(
+                """
+                UPDATE transfer_events
+                SET previous_event_hash = ?, event_hash = ?
+                WHERE tenant_id = ? AND event_id = ?
+                """,
+                (previous_hash, event_hash, tenant_id, row["event_id"]),
+            )
+            previous_hash = event_hash
 
     async def _get_active_idempotency_row(
         self, connection: aiosqlite.Connection, tenant_id: str, idempotency_key: str
@@ -1458,7 +1560,9 @@ class SqliteTransferStore:
         )
         row = await cursor.fetchone()
         await cursor.close()
-        return None if row is None else row["event_hash"]
+        if row is not None:
+            return row["event_hash"]
+        return await self._latest_checkpoint_hash(connection, tenant_id)
 
     async def _next_event_order(
         self, connection: aiosqlite.Connection, tenant_id: str
@@ -1478,13 +1582,18 @@ class SqliteTransferStore:
         return [row["tenant_id"] for row in rows]
 
     def _transfer_from_row(self, row: aiosqlite.Row) -> TransferRecord:
-        result = TransferResult.model_validate(json.loads(row["result_json"])) if row["result_json"] else None
-        error = ProblemDetail.model_validate(json.loads(row["error_json"])) if row["error_json"] else None
+        request_payload = self._decode_json_payload(row["request_json"])
+        if request_payload.get("payload_purged"):
+            request_payload = _purged_request_payload(row)
+        result_payload = self._decode_json_payload(row["result_json"]) if row["result_json"] else None
+        error_payload = self._decode_json_payload(row["error_json"]) if row["error_json"] else None
+        result = TransferResult.model_validate(result_payload) if result_payload else None
+        error = ProblemDetail.model_validate(error_payload) if error_payload else None
         return TransferRecord(
             transfer_id=row["transfer_id"],
             tenant_id=row["tenant_id"],
             status=TransferStatus(row["status"]),
-            request=TransferRequest.model_validate(json.loads(row["request_json"])),
+            request=TransferRequest.model_validate(request_payload),
             connector_id=row["connector_id"],
             mapping_id=row["mapping_id"],
             connector_version=int(row["connector_version"]),
@@ -1503,17 +1612,59 @@ class SqliteTransferStore:
         )
 
     def _encode_correction_payload(self, values: dict[str, Any]) -> str:
-        plaintext = _json_dumps(values).encode("utf-8")
-        if self._protector is None:
-            return plaintext.decode("utf-8")
-        ciphertext = self._protector.encrypt(plaintext)
-        return base64.b64encode(ciphertext).decode("ascii")
+        return self._encode_json_payload(values)
 
     def _decode_correction_payload(self, stored: str) -> dict[str, Any]:
+        return self._decode_json_payload(stored)
+
+    def _encode_json_payload(self, value: Any) -> str:
+        plaintext = _json_dumps(value).encode("utf-8")
+        if self._protector is None:
+            return plaintext.decode("utf-8")
+        return base64.b64encode(self._protector.encrypt(plaintext)).decode("ascii")
+
+    def _decode_json_payload(self, stored: str) -> dict[str, Any]:
         if self._protector is None:
             return json.loads(stored)
-        plaintext = self._protector.decrypt(base64.b64decode(stored.encode("ascii")))
+        try:
+            ciphertext = base64.b64decode(stored.encode("ascii"))
+            plaintext = self._protector.decrypt(ciphertext)
+        except Exception:
+            if not self._allow_legacy_plaintext or isinstance(self._protector, FernetPayloadProtector):
+                raise
+            return json.loads(stored)
         return json.loads(plaintext.decode("utf-8"))
+
+    def _encode_event_detail(self, detail: dict[str, Any]) -> str:
+        if self._protector is None:
+            return _json_dumps(detail)
+        if self._allow_legacy_plaintext and not isinstance(self._protector, FernetPayloadProtector):
+            return _json_dumps(detail)
+        return self._encode_json_payload(self._redactor.event_detail(detail))
+
+    def _decode_event_detail(self, stored: str) -> dict[str, Any]:
+        if self._protector is None or (
+            self._allow_legacy_plaintext
+            and not isinstance(self._protector, FernetPayloadProtector)
+        ):
+            return json.loads(stored)
+        return self._decode_json_payload(stored)
+
+    async def _latest_checkpoint_hash(
+        self, connection: aiosqlite.Connection, tenant_id: str
+    ) -> str | None:
+        cursor = await connection.execute(
+            """
+            SELECT checkpoint_hash FROM audit_chain_checkpoints
+            WHERE tenant_id = ?
+            ORDER BY created_at DESC, checkpoint_id DESC
+            LIMIT 1
+            """,
+            (tenant_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return None if row is None else row["checkpoint_hash"]
 
 
 def _json_default(value: Any) -> Any:
@@ -1530,6 +1681,37 @@ def _json_dumps(value: Any) -> str:
 
 def _sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _event_hash(
+    *,
+    previous_hash: str | None,
+    event_order: int,
+    event_id: str,
+    tenant_id: str,
+    transfer_id: str,
+    from_status: str,
+    to_status: str,
+    event_type: str,
+    detail_json: str,
+    created_at: str,
+) -> str:
+    return _sha256_hex(
+        "|".join(
+            [
+                previous_hash or "",
+                str(event_order),
+                event_id,
+                tenant_id,
+                transfer_id,
+                from_status,
+                to_status,
+                event_type,
+                detail_json,
+                created_at,
+            ]
+        )
+    )
 
 
 def encode_transfer_cursor(record: TransferRecord) -> str:
@@ -1572,6 +1754,36 @@ def _safe_reconciliation_detail(detail: dict[str, Any]) -> dict[str, Any]:
     return {key: detail[key] for key in allowed if key in detail}
 
 
+def _purged_request_payload(row: aiosqlite.Row) -> dict[str, Any]:
+    return {
+        "schema_version": "ocr-transfer/v1",
+        "document": {
+            "document_id": row["document_id"],
+            "document_type": row["document_type"],
+            "source_system": "redacted",
+        },
+        "ocr": {
+            "fields": {
+                "payload_purged": {
+                    "value_type": "string",
+                    "status": "missing",
+                }
+            }
+        },
+        "delivery": {
+            "connector_id": row["connector_id"],
+            "mapping_id": row["mapping_id"],
+            "operation": "upsert",
+            "deduplication_key_path": "",
+        },
+        "metadata": {
+            "tenant_id": row["tenant_id"],
+            "correlation_id": row["correlation_id"],
+            "labels": {},
+        },
+    }
+
+
 def _normalize_connector_payload(value: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(value)
     spec = normalized.get("spec")
@@ -1596,7 +1808,7 @@ def _utc_now() -> datetime:
 
 async def create_payload_protector(settings: Any, resolver: Any) -> PayloadProtector:
     if settings.data_encryption_key_ref is None:
-        raise RuntimeError("data_encryption_key_ref is required")
+        raise RuntimeError("data encryption key reference is required")
     key_ref = settings.data_encryption_key_ref
     if isinstance(key_ref, SecretStr):
         resolved_ref = key_ref.get_secret_value()

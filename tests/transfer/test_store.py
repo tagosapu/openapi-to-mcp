@@ -28,7 +28,7 @@ async def store(test_settings, tmp_path):
     from src.transfer.store import SqliteTransferStore
 
     db_path = tmp_path / "store.sqlite3"
-    transfer_store = SqliteTransferStore(db_path)
+    transfer_store = SqliteTransferStore(db_path, allow_legacy_plaintext=True)
     await transfer_store.initialize()
     try:
         yield transfer_store
@@ -41,7 +41,9 @@ async def encrypted_store(tmp_path):
     from src.transfer.store import SqliteTransferStore
 
     db_path = tmp_path / "encrypted.sqlite3"
-    transfer_store = SqliteTransferStore(db_path, protector=PrefixProtector())
+    transfer_store = SqliteTransferStore(
+        db_path, protector=PrefixProtector(), allow_legacy_plaintext=True
+    )
     await transfer_store.initialize()
     try:
         yield transfer_store, db_path
@@ -209,7 +211,11 @@ async def test_create_or_get_transfer_honors_retention_and_allows_reuse_after_ex
 
     now = datetime(2026, 9, 18, 0, 0, tzinfo=UTC)
     monkeypatch.setattr(store_module, "_utc_now", lambda: now)
-    store = SqliteTransferStore(tmp_path / "retention.sqlite3", idempotency_retention=timedelta(hours=1))
+    store = SqliteTransferStore(
+        tmp_path / "retention.sqlite3",
+        idempotency_retention=timedelta(hours=1),
+        allow_legacy_plaintext=True,
+    )
     await store.initialize()
     try:
         await store.save_connector(

@@ -25,5 +25,5 @@ class MappingValidationError(TransferError):
     pass
 
 
-class PayloadLimitError(TransferError):
+class PayloadLimitError(TransferError, ValueError):
     pass

@@ -38,6 +38,8 @@ dependencies = [
     "pyjwt[crypto]>=2.14.0",
     "uvicorn>=0.35.0",
     "cryptography>=45.0.5",
+    "prometheus-client>=0.26.0",
+    "opentelemetry-api>=1.44.0",
 ]
 
 [project.scripts]

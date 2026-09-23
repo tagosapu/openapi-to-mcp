@@ -13,7 +13,8 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "ocr-transfer/v1"
+      "const": "ocr-transfer/v1",
+      "type": "string"
     },
     "document": {
       "$ref": "#/$defs/document"
