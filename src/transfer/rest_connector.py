@@ -36,6 +36,10 @@ class _OAuthToken:
     expires_at: datetime
 
 
+class _SecurityOptionUnavailable(ValueError):
+    pass
+
+
 class RestOpenApiConnector:
     def __init__(
         self,
@@ -351,36 +355,68 @@ class RestOpenApiConnector:
     async def _build_auth(self, operation: NormalizedOperation) -> tuple[dict[str, str], dict[str, str]]:
         if not operation.security_options:
             return {}, {}
-        option = operation.security_options[0]
         spec_schemes = self._definition.spec.get("components", {}).get("securitySchemes", {})
         bundle = await self._credential_resolver.resolve(self._definition.credential_ref)
+        unavailable: _SecurityOptionUnavailable | None = None
+        for option in operation.security_options:
+            try:
+                return await self._build_auth_option(option, spec_schemes, bundle)
+            except _SecurityOptionUnavailable as exc:
+                unavailable = exc
+        if unavailable is not None:
+            raise ValueError("AUTHENTICATION_OPTION_UNAVAILABLE") from unavailable
+        raise ValueError("AUTHENTICATION_OPTION_UNAVAILABLE")
+
+    async def _build_auth_option(
+        self,
+        option: Any,
+        spec_schemes: dict[str, Any],
+        bundle: SecretBundle,
+    ) -> tuple[dict[str, str], dict[str, str]]:
         headers: dict[str, str] = {}
         query: dict[str, str] = {}
         for scheme_name, scopes in option.schemes.items():
             scheme = spec_schemes.get(scheme_name, {})
             scheme_type = scheme.get("type")
             if scheme_type == "apiKey":
-                secret = _bundle_secret_value(bundle, preferred=(scheme_name, "auth", "api_key", "token", "value"))
+                try:
+                    secret = _bundle_secret_value(
+                        bundle,
+                        preferred=(scheme_name, "auth", "api_key", "token", "value"),
+                    )
+                except ValueError as exc:
+                    raise _SecurityOptionUnavailable from exc
                 if scheme.get("in") == "query":
                     query[str(scheme.get("name"))] = secret
                 else:
                     headers[str(scheme.get("name"))] = secret
                 continue
             if scheme_type == "http" and str(scheme.get("scheme", "")).lower() == "bearer":
-                token = _bundle_secret_value(bundle, preferred=(scheme_name, "token", "access_token", "value"))
+                try:
+                    token = _bundle_secret_value(
+                        bundle,
+                        preferred=(scheme_name, "token", "access_token", "value"),
+                    )
+                except ValueError as exc:
+                    raise _SecurityOptionUnavailable from exc
                 headers["Authorization"] = f"Bearer {token}"
                 continue
             if scheme_type == "http" and str(scheme.get("scheme", "")).lower() == "basic":
                 import base64
 
-                username = _bundle_secret_value(bundle, preferred=("username", "user"))
-                password = _bundle_secret_value(bundle, preferred=("password", "pass"))
+                try:
+                    username = _bundle_secret_value(bundle, preferred=("username", "user"))
+                    password = _bundle_secret_value(bundle, preferred=("password", "pass"))
+                except ValueError as exc:
+                    raise _SecurityOptionUnavailable from exc
                 token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
                 headers["Authorization"] = f"Basic {token}"
                 continue
             if scheme_type == "oauth2":
                 token = await self._oauth_access_token(scheme_name, scheme, scopes, bundle)
                 headers["Authorization"] = f"Bearer {token}"
+                continue
+            raise _SecurityOptionUnavailable
         return headers, query
 
     async def _oauth_access_token(

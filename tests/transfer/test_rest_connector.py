@@ -276,6 +276,40 @@ async def test_build_request_supports_query_api_key_when_declared() -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_request_tries_openapi_security_options_in_order() -> None:
+    from src.transfer.rest_connector import RestOpenApiConnector
+
+    spec = _base_spec(
+        {"type": "apiKey", "in": "header", "name": "X-Api-Key"},
+        security_name="apiKey",
+        security=[{"apiKey": []}, {"bearerAuth": []}],
+    )
+    spec["components"]["securitySchemes"]["bearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+    }
+    connector = RestOpenApiConnector(
+        _definition(spec),
+        MappingEngine(),
+        StaticCredentialResolver(
+            {
+                "vault://connectors/connector-test": {
+                    "bearerAuth": "bearer-token",
+                    "unused": "not-an-api-key",
+                },
+                "config://headers/x-api-version": {"value": "2026-09-18"},
+            }
+        ),
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(201))),
+    )
+
+    request = await connector.build_request(_parts())
+
+    assert request.headers["Authorization"] == "Bearer bearer-token"
+    assert "X-Api-Key" not in request.headers
+
+
+@pytest.mark.asyncio
 async def test_build_request_preserves_base_url_path_prefix() -> None:
     from src.transfer.rest_connector import RestOpenApiConnector
 
