@@ -202,11 +202,17 @@ def create_router() -> APIRouter:
         except Exception as exc:
             raise _api_error_from_exception(exc, correlation_id=payload.metadata.correlation_id) from exc
 
-        _observability(request).record_event(
+        with _observability(request).span(
+            "transfer.accepted",
             status=created.record.status.value,
             classification="accepted",
             connector_id=created.record.connector_id,
-        )
+        ):
+            _observability(request).record_event(
+                status=created.record.status.value,
+                classification="accepted",
+                connector_id=created.record.connector_id,
+            )
 
         headers = {"X-Correlation-ID": created.record.correlation_id}
         if created.idempotent_replay:

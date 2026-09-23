@@ -92,6 +92,7 @@ class TransferWorker:
 
         phase = "validation" if claim.phase == "validate" else "delivery"
         started = perf_counter()
+        observed_status = claim.record.status.value
         try:
             with self._observability.span(
                 f"transfer.{phase}",
@@ -102,10 +103,15 @@ class TransferWorker:
                     await self._handle_validate_claim(claim.record)
                 else:
                     await self._handle_deliver_claim(claim.record)
+            updated_record = await self._store.get_transfer(
+                claim.record.tenant_id, claim.record.transfer_id
+            )
+            if updated_record is not None:
+                observed_status = updated_record.status.value
         finally:
             self._observability.record_event(
-                status=claim.record.status.value,
-                classification=claim.phase,
+                status=observed_status,
+                classification=phase,
                 connector_id=claim.record.connector_id,
                 duration_ms=int((perf_counter() - started) * 1000),
             )
