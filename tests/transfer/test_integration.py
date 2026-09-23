@@ -650,21 +650,27 @@ def target_api() -> TargetApi:
 def integration_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     encryption_key = Fernet.generate_key().decode("ascii")
     credentials = {
-        "vault://connectors/api-key": {"auth": "test-target-key"},
-        "vault://connectors/bearer": {"token": "test-alt-token"},
-        "vault://connectors/basic": {
-            "username": "test-basic-user",
-            "password": "test-basic-password",
+        "tenants": {
+            "tenant-a": {
+                "vault://connectors/api-key": {"auth": "test-target-key"},
+                "vault://connectors/bearer": {"token": "test-alt-token"},
+                "vault://connectors/basic": {
+                    "username": "test-basic-user",
+                    "password": "test-basic-password",
+                },
+                "vault://connectors/oauth2": {
+                    "client_id": "test-oauth-client",
+                    "client_secret": "test-oauth-secret",
+                },
+            }
         },
-        "vault://connectors/oauth2": {
-            "client_id": "test-oauth-client",
-            "client_secret": "test-oauth-secret",
+        "global": {
+            "config://headers/target-api-version": {"value": "2026-01-01"},
+            "config://headers/alternate-api-version": {"value": "2026-02-01"},
+            "config://headers/basic-api-version": {"value": "2026-03-01"},
+            "config://headers/oauth-api-version": {"value": "2026-04-01"},
+            "key://transfer/data": encryption_key,
         },
-        "config://headers/target-api-version": {"value": "2026-01-01"},
-        "config://headers/alternate-api-version": {"value": "2026-02-01"},
-        "config://headers/basic-api-version": {"value": "2026-03-01"},
-        "config://headers/oauth-api-version": {"value": "2026-04-01"},
-        "key://transfer/data": encryption_key,
     }
     monkeypatch.setattr(
         "src.transfer.rest_connector.resolve_host_addresses",

@@ -140,7 +140,7 @@ class RestOpenApiConnector:
         if binding is not None and binding.idempotency_header:
             headers[binding.idempotency_header] = parts.idempotency_key
         for additional in self._definition.additional_headers:
-            bundle = await self._resolve_credential(additional.value_ref)
+            bundle = await self._credential_resolver.resolve(additional.value_ref)
             headers[additional.name] = _bundle_secret_value(bundle)
         auth_headers, auth_query = await self._build_auth(operation)
         headers.update(auth_headers)
@@ -614,11 +614,7 @@ class ConnectorRegistry:
                 snapshot.credential_ref,
             )
             for additional in snapshot.additional_headers:
-                await _resolve_for_tenant(
-                    self._credential_resolver,
-                    tenant_id,
-                    additional.value_ref,
-                )
+                await self._credential_resolver.resolve(additional.value_ref)
             connector = RestOpenApiConnector(
                 snapshot,
                 MappingEngine(),

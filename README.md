@@ -265,13 +265,14 @@ TRANSFER_WORKER_POLL_SECONDS=1
 TRANSFER_REQUESTS_PER_MINUTE=120
 TRANSFER_BURST=20
 TRANSFER_DATA_ENCRYPTION_KEY_REF=key://transfer/data
-TRANSFER_CREDENTIALS_JSON={"tenants":{"tenant-a":{"vault://connectors/invoice-target":{"auth":"REPLACE_WITH_TARGET_SECRET"},"config://headers/target-api-version":{"value":"2026-01-01"}}},"global":{"key://transfer/data":"REPLACE_WITH_FERNET_KEY"}}
+TRANSFER_CREDENTIALS_JSON={"tenants":{"tenant-a":{"vault://connectors/invoice-target":{"auth":"REPLACE_WITH_TARGET_SECRET"}}},"global":{"config://headers/target-api-version":{"value":"2026-01-01"},"key://transfer/data":"REPLACE_WITH_FERNET_KEY"}}
 ```
 
 `TRANSFER_CREDENTIALS_JSON` is the resolver input: connector `credential_ref`
-values select a bundle inside the authenticated tenant, `config://...` values
-provide non-secret connector headers, and the `global` `key://...` entry supplies
-the Fernet key referenced by `TRANSFER_DATA_ENCRYPTION_KEY_REF`. Keep the
+values select a bundle inside the authenticated tenant, while `config://...`
+values in `global` provide non-secret connector headers and the `global`
+`key://...` entry supplies the Fernet key referenced by
+`TRANSFER_DATA_ENCRYPTION_KEY_REF`. Keep the
 replacement values in a protected environment or secret manager. The retention
 settings in `env.example` control idempotency, payload, and audit retention and
 have defaults.

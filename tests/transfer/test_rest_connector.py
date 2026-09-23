@@ -1094,9 +1094,11 @@ async def test_registry_rejects_cross_tenant_credential_reference(tmp_path: Path
                 "tenants": {
                     "tenant-a": {
                         "vault://connectors/connector-test": {"token": "tenant-a-token"},
-                        "config://headers/x-api-version": {"value": "2026-09-18"},
                     }
-                }
+                },
+                "global": {
+                    "config://headers/x-api-version": {"value": "2026-09-18"},
+                },
             }
         ),
     )

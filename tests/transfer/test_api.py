@@ -37,10 +37,12 @@ def test_settings(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
                 "tenants": {
                     "tenant-a": {
                         "vault://connectors/connector-test": {"token": "connector-token"},
-                        "config://headers/x-api-version": {"value": "2026-09-18"},
                     }
                 },
-                "global": {"key://tests/transfer": encryption_key},
+                "global": {
+                    "config://headers/x-api-version": {"value": "2026-09-18"},
+                    "key://tests/transfer": encryption_key,
+                },
             }
         ),
     )
