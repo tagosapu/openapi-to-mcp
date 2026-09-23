@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
@@ -44,6 +45,20 @@ class PrefixProtector:
     def decrypt(self, ciphertext: bytes) -> bytes:
         assert ciphertext.startswith(b"enc:")
         return ciphertext[4:][::-1]
+
+
+class RecordingObservability:
+    def __init__(self) -> None:
+        self.spans: list[tuple[str, dict[str, Any]]] = []
+        self.events: list[dict[str, Any]] = []
+
+    @contextmanager
+    def span(self, name: str, **attributes: Any):
+        self.spans.append((name, attributes))
+        yield None
+
+    def record_event(self, **event: Any) -> None:
+        self.events.append(event)
 
 
 class FakeConnector:
@@ -407,6 +422,30 @@ async def test_worker_moves_low_confidence_payload_to_review_without_http_call(s
     assert record is not None
     assert record.status == TransferStatus.WAITING_REVIEW
     assert connector.send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_observability_records_final_status(store, monkeypatch) -> None:
+    await _save_prereqs(store)
+    observability = RecordingObservability()
+    worker = TransferWorker(
+        store,
+        FakeRegistry({("tenant-a", "connector-test", 7): FakeConnector()}),
+        MappingEngine(),
+        RetryPolicy(jitter_ratio=0.0),
+        observability=observability,
+    )
+    transfer_id = await seed_queued_transfer(store, suffix="observability")
+    monkeypatch.setattr("src.transfer.worker._utc_now", lambda: FIXED_NOW)
+
+    assert await worker.run_once() is True
+
+    record = await store.get_transfer("tenant-a", transfer_id)
+    assert record is not None
+    assert record.status == TransferStatus.SUCCEEDED
+    assert observability.spans[0][0] == "transfer.delivery"
+    assert observability.events[-1]["status"] == TransferStatus.SUCCEEDED.value
+    assert observability.events[-1]["classification"] == "delivery"
 
 
 @pytest.mark.asyncio
