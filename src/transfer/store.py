@@ -1270,7 +1270,7 @@ class SqliteTransferStore:
                     """
                     SELECT * FROM transfer_events
                     WHERE tenant_id = ? AND created_at < ?
-                    ORDER BY created_at ASC, event_order ASC
+                    ORDER BY event_order ASC
                     """,
                     (tenant, _isoformat(before)),
                 )
@@ -1610,7 +1610,7 @@ class SqliteTransferStore:
             """
             SELECT event_hash FROM transfer_events
             WHERE tenant_id = ?
-            ORDER BY created_at DESC, event_order DESC
+            ORDER BY event_order DESC
             LIMIT 1
             """,
             (tenant_id,),

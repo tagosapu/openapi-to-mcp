@@ -867,6 +867,53 @@ async def test_audit_chain_uses_stable_order_for_same_timestamp_events(store, mo
 
 
 @pytest.mark.asyncio
+async def test_audit_chain_uses_event_order_when_timestamps_skew(store, monkeypatch) -> None:
+    from src.transfer import store as store_module
+    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+
+    await store.save_connector(
+        ConnectorDefinition.model_validate(sample_connector_definition()),
+        tenant_id="tenant-a",
+    )
+    await store.save_mapping(
+        MappingDefinition.model_validate(sample_mapping()),
+        tenant_id="tenant-a",
+    )
+    event_times = iter(
+        [
+            datetime(2026, 9, 18, 1, 0, 3, tzinfo=UTC),
+            datetime(2026, 9, 18, 1, 0, 1, tzinfo=UTC),
+            datetime(2026, 9, 18, 1, 0, 2, tzinfo=UTC),
+        ]
+    )
+    monkeypatch.setattr(store_module, "_utc_now", lambda: next(event_times))
+    created = await store.create_or_get_transfer(
+        tenant_id="tenant-a",
+        idempotency_key="audit-clock-skew",
+        request=TransferRequest.model_validate(sample_transfer_request()),
+        correlation_id="corr-audit-clock-skew",
+        connector_version=7,
+        mapping_version=3,
+    )
+    await store.transition(
+        "tenant-a",
+        created.record.transfer_id,
+        TransferStatus.ACCEPTED,
+        TransferStatus.VALIDATING,
+        {"reason": "validation started"},
+    )
+    await store.transition(
+        "tenant-a",
+        created.record.transfer_id,
+        TransferStatus.VALIDATING,
+        TransferStatus.QUEUED,
+        {"reason": "validated"},
+    )
+
+    assert await store.verify_audit_chain("tenant-a") is True
+
+
+@pytest.mark.asyncio
 async def test_review_corrections_are_encrypted_and_events_are_redacted(encrypted_store) -> None:
     store, db_path = encrypted_store
     from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest
