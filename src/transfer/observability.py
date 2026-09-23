@@ -60,12 +60,14 @@ _SAFE_DETAIL_KEYS = {
     "mapping_version",
     "operation",
     "phase",
+    "reason",
     "reason_present",
     "request_id",
     "resolution",
     "status",
     "target_resource_id",
     "to_status",
+    "correction_ref",
 }
 _LABEL_NAMES = ("status", "classification")
 

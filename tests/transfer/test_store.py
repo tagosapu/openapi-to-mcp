@@ -893,7 +893,7 @@ async def test_review_corrections_are_encrypted_and_events_are_redacted(encrypte
         connection.close()
 
     assert "INV-UPDATED" not in stored_correction_json
-    detail = json.loads(stored_detail_json)
+    detail = store._decode_event_detail(stored_detail_json)
     assert detail == {
         "actor": "reviewer-1",
         "reason": "fix OCR",

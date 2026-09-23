@@ -1045,7 +1045,7 @@ async def test_worker_review_correct_saves_encrypted_correction_and_redacts_even
     assert "INV-REVIEWED" not in stored_correction_json
     assert all("INV-REVIEWED" not in detail for detail in stored_event_details)
     assert any(
-        json.loads(detail) == {
+        store._decode_event_detail(detail) == {
             "actor": actor,
             "reason": "fix OCR",
             "correction_ref": latest_correction.correction_ref,
@@ -1259,7 +1259,7 @@ async def test_worker_records_operator_reconciliation_evidence(
         row = await cursor.fetchone()
         await cursor.close()
         assert row is not None
-        detail = json.loads(row["detail_json"])
+        detail = store._decode_event_detail(row["detail_json"])
         assert detail["resolution"] == "unresolved"
         assert detail["notes_present"] is True
         assert "needs another check" not in row["detail_json"]

@@ -1638,15 +1638,10 @@ class SqliteTransferStore:
     def _encode_event_detail(self, detail: dict[str, Any]) -> str:
         if self._protector is None:
             return _json_dumps(detail)
-        if self._allow_legacy_plaintext and not isinstance(self._protector, FernetPayloadProtector):
-            return _json_dumps(detail)
         return self._encode_json_payload(self._redactor.event_detail(detail))
 
     def _decode_event_detail(self, stored: str) -> dict[str, Any]:
-        if self._protector is None or (
-            self._allow_legacy_plaintext
-            and not isinstance(self._protector, FernetPayloadProtector)
-        ):
+        if self._protector is None:
             return json.loads(stored)
         return self._decode_json_payload(stored)
 
