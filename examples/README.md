@@ -44,3 +44,25 @@ You should see:
 3. MCP client connects, lists available tools, and tests each one
 
 This validates the complete flow from OpenAPI specification to working MCP server integration.
+
+## Testing Kintone Output with a Local Mock
+
+`kintone_stub_server.py` provides an in-memory Kintone-compatible backend for local
+testing. It supports API-token authentication, app metadata, record list/get/create/
+update/delete operations, GET-over-POST for long queries, and request inspection.
+
+Start it in one terminal:
+
+```bash
+uv run python examples/kintone_stub_server.py --port 9100
+```
+
+The default API token is `mock-token`. The mock backend is available at
+`http://127.0.0.1:9100`, so a fully generated MCP server can be pointed at it with
+`--base-url http://127.0.0.1:9100` or `API_BASE_URL`.
+
+The current Kintone result may contain a fallback MCP server when LLM code
+generation fails. In that case it exposes only `api_info` and cannot call the
+Kintone mock. Confirm that the generated server contains endpoint tools before
+running the end-to-end test. The mock request history can be inspected at
+`GET http://127.0.0.1:9100/__mock/requests`.
