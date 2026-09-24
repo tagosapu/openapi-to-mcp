@@ -15,7 +15,11 @@ import yaml
 from pydantic import ValidationError
 from .models.evaluation import OpenAPIEvaluationResult
 from .services.config_loader import config
-from .services.mcp_generator import MCPServerGenerator
+from .services.mcp_generator import (
+    MCPGenerationError,
+    MCPServerGenerator,
+    _count_openapi_operations,
+)
 from .services.openapi_enhancer import (
     EnhancementRequest,
     EnhancementResult,
@@ -864,6 +868,29 @@ async def _generate_mcp_server(
     model: str = None,
 ) -> Tuple[Optional[Path], Dict[str, Any]]:
     """Generate MCP server code from OpenAPI specification."""
+    operation_count = (
+        _count_openapi_operations(openapi_spec) if isinstance(openapi_spec, dict) else 0
+    )
+
+    def failed_usage(error: Exception) -> Dict[str, Any]:
+        validation = getattr(error, "validation", {})
+        if isinstance(error, MCPGenerationError):
+            error_message = " ".join(str(error).split())[:500]
+        else:
+            error_message = f"{type(error).__name__}: MCP generation failed"
+        return {
+            "server_usage": {},
+            "client_usage": {},
+            "total_tokens": 0,
+            "total_cost_usd": 0.0,
+            "calls_count": 0,
+            "generation_status": "failed",
+            "operation_count": validation.get("operation_count", operation_count),
+            "tool_count": validation.get("tool_count", 0),
+            "fallback": bool(validation.get("fallback", False)),
+            "validation_errors": [error_message],
+        }
+
     try:
         logger.info("🚀 Starting MCP server generation process...")
 
@@ -873,7 +900,7 @@ async def _generate_mcp_server(
             logger.error(
                 f"❌ Step 1 FAILED: Expected dictionary, got {type(openapi_spec)}"
             )
-            return None
+            return None, failed_usage(MCPGenerationError("invalid OpenAPI specification"))
 
         logger.info("✅ Step 1 PASSED: Valid OpenAPI specification provided")
 
@@ -978,14 +1005,7 @@ async def _generate_mcp_server(
         import traceback
 
         logger.error(f"   Full traceback: {traceback.format_exc()}")
-        empty_usage = {
-            "server_usage": {},
-            "client_usage": {},
-            "total_tokens": 0,
-            "total_cost_usd": 0.0,
-            "calls_count": 0,
-        }
-        return None, empty_usage
+        return None, failed_usage(e)
     finally:
         logger.info("🔍 Exiting _generate_mcp_server function")
 
@@ -1021,7 +1041,7 @@ async def _handle_mcp_generation(
         logger.info(f"✅ Parsed OpenAPI spec: {len(openapi_spec_dict)} top-level keys")
     except Exception as e:
         logger.error(f"❌ Failed to parse OpenAPI spec: {e}")
-        return None
+        raise MCPGenerationError("failed to parse OpenAPI specification") from e
 
     logger.info("🚀 Attempting MCP server generation...")
     mcpserver_path, mcp_usage = await _generate_mcp_server(
@@ -1032,6 +1052,12 @@ async def _handle_mcp_generation(
         _update_evaluation_with_mcp_usage(
             evaluation, mcp_usage, result, output_config, openapi_spec
         )
+
+    if mcp_usage.get("generation_status") == "failed":
+        validation_errors = mcp_usage.get("validation_errors") or [
+            "generated MCP artifact validation failed"
+        ]
+        raise MCPGenerationError(f"MCP generation failed: {validation_errors[0]}")
 
     if mcpserver_path:
         logger.info(f"✅ MCP server generation completed: {mcpserver_path}")
@@ -1140,6 +1166,11 @@ async def _execute_cli_workflow(args: argparse.Namespace) -> bool:
     except ValidationError as e:
         logger.error(f"❌ Validation error: {e}")
         print(f"❌ Invalid configuration or response format: {e}")
+        await cleanup_llm_client()
+        return False
+    except MCPGenerationError as e:
+        logger.error(f"❌ MCP generation failed: {e}")
+        print(f"❌ MCP generation failed: {e}")
         await cleanup_llm_client()
         return False
     except Exception as e:

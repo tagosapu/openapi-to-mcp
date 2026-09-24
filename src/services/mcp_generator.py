@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from .llm_client import get_llm_client, LLMRequest
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 # Configure logging with basicConfig
@@ -20,6 +20,27 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+class MCPGenerationError(RuntimeError):
+    """Raised when generated MCP code is not a complete executable artifact."""
+
+    def __init__(
+        self, message: str, validation: Optional[Mapping[str, Any]] = None
+    ) -> None:
+        super().__init__(message)
+        self.validation = dict(validation or {})
+
+
+def _count_openapi_operations(openapi_spec: Mapping[str, Any]) -> int:
+    """Count HTTP operations declared under the OpenAPI paths object."""
+    methods = {"get", "post", "put", "patch", "delete", "head", "options", "trace"}
+    return sum(
+        1
+        for path_item in openapi_spec.get("paths", {}).values()
+        for method in path_item
+        if method.lower() in methods
+    )
 
 
 def _extract_function_signature(func_node: ast.FunctionDef) -> str:
@@ -333,6 +354,20 @@ class MCPServerGenerator:
                 logger.error(f"❌ Failed to generate server code: {e}")
                 raise
 
+            operation_count = _count_openapi_operations(openapi_spec)
+            validation = self._validate_generated_server(
+                server_code, expected_operation_count=operation_count
+            )
+            if not server_usage.get("calls_count"):
+                validation["errors"].append(
+                    "server generation usage was not recorded"
+                )
+                validation["valid"] = False
+            if not validation["valid"]:
+                error_message = "; ".join(validation["errors"])
+                logger.error(f"❌ Generated server validation failed: {error_message}")
+                raise MCPGenerationError(error_message, validation=validation)
+
             # Parse tools from generated server code
             logger.info("🔍 Parsing tools from generated server code...")
             try:
@@ -371,6 +406,23 @@ class MCPServerGenerator:
                     mcp_tools, api_title
                 )
                 logger.info(f"✅ Client code generated: {len(client_code)} characters")
+
+                if "Fallback implementation" in client_code or "fallback mode" in client_code.lower():
+                    validation["fallback"] = True
+                    validation["errors"].append(
+                        "generated client code is a fallback implementation"
+                    )
+                if not client_usage.get("calls_count"):
+                    validation["errors"].append(
+                        "client generation usage was not recorded"
+                    )
+                if validation["errors"]:
+                    validation["valid"] = False
+                    error_message = "; ".join(validation["errors"])
+                    logger.error(
+                        f"❌ Generated client validation failed: {error_message}"
+                    )
+                    raise MCPGenerationError(error_message, validation=validation)
 
                 client_path = output_dir / "client.py"
                 with open(client_path, "w", encoding="utf-8") as f:
@@ -437,6 +489,10 @@ class MCPServerGenerator:
                 + client_usage.get("total_cost_usd", 0.0),
                 "calls_count": server_usage.get("calls_count", 0)
                 + client_usage.get("calls_count", 0),
+                "generation_status": "complete",
+                "operation_count": validation["operation_count"],
+                "tool_count": validation["tool_count"],
+                "validation_errors": validation["errors"],
             }
 
             logger.info(
@@ -459,6 +515,39 @@ class MCPServerGenerator:
 
             logger.error(f"   Full traceback: {traceback.format_exc()}")
             raise
+
+    @staticmethod
+    def _validate_generated_server(
+        code: str, expected_operation_count: int
+    ) -> Dict[str, Any]:
+        """Validate that generated code represents every OpenAPI operation."""
+        errors: List[str] = []
+        try:
+            ast.parse(code)
+        except SyntaxError as exc:
+            errors.append(f"syntax error: {exc.msg}")
+
+        tools = _parse_mcp_tools_from_code(code)
+        fallback = "Fallback implementation" in code or "fallback mode" in code.lower()
+        if "from mcp.server.fastmcp import FastMCP" not in code:
+            errors.append("missing required FastMCP import")
+        if "def main(" not in code:
+            errors.append("missing main function")
+        if fallback:
+            errors.append("generated code is a fallback implementation")
+        if len(tools) != expected_operation_count:
+            errors.append(
+                f"tool count {len(tools)} does not match operation count "
+                f"{expected_operation_count}"
+            )
+
+        return {
+            "valid": not errors,
+            "fallback": fallback,
+            "operation_count": expected_operation_count,
+            "tool_count": len(tools),
+            "errors": errors,
+        }
 
     def _clean_name(self, name: str) -> str:
         """Clean a name to be a valid Python identifier."""
