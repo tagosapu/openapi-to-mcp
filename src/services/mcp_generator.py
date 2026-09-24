@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from .llm_client import get_llm_client, LLMRequest
+from .openapi_mcp_codegen import count_operations, write_generated_artifacts
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
@@ -206,6 +207,7 @@ class MCPServerGenerator:
         temperature: float = None,
         timeout_seconds: int = None,
         debug: bool = None,
+        use_legacy_llm: bool = False,
     ):
         """Initialize the MCP server generator.
 
@@ -230,6 +232,7 @@ class MCPServerGenerator:
         self.temperature = self.llm_client.temperature
         self.timeout_seconds = self.llm_client.timeout_seconds
         self.debug = self.llm_client.debug
+        self.use_legacy_llm = use_legacy_llm
 
         logger.info("Initialized MCP server generator with unified LLM client")
         logger.info(
@@ -311,6 +314,9 @@ class MCPServerGenerator:
         Returns:
             Dict containing paths to generated files
         """
+        if not self.use_legacy_llm:
+            return self._generate_deterministic_server_code(openapi_spec, output_dir)
+
         try:
             logger.info("🔄 Starting LLM-based MCP server code generation")
 
@@ -515,6 +521,47 @@ class MCPServerGenerator:
 
             logger.error(f"   Full traceback: {traceback.format_exc()}")
             raise
+
+    def _generate_deterministic_server_code(
+        self, openapi_spec: Dict[str, Any], output_dir: Path
+    ) -> Tuple[Dict[str, str], Dict[str, Any]]:
+        """Generate sibling artifacts without invoking an LLM."""
+        generated_paths = write_generated_artifacts(openapi_spec, output_dir)
+        server_code = generated_paths["server.py"].read_text(encoding="utf-8")
+        validation = self._validate_generated_server(
+            server_code, expected_operation_count=count_operations(openapi_spec)
+        )
+        if not validation["valid"]:
+            message = "; ".join(validation["errors"])
+            raise MCPGenerationError(message, validation=validation)
+
+        generated_files = {
+            filename: str(path) for filename, path in generated_paths.items()
+        }
+        generation_metadata = {
+            "generation_status": "complete",
+            "operation_count": validation["operation_count"],
+            "tool_count": validation["tool_count"],
+            "validation_errors": validation["errors"],
+            "fallback": validation["fallback"],
+        }
+        empty_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "total_cost_usd": 0.0,
+            "calls_count": 0,
+            "source": "deterministic",
+        }
+        usage = {
+            "server_usage": {**empty_usage, **generation_metadata},
+            "client_usage": {**empty_usage, **generation_metadata},
+            "total_tokens": 0,
+            "total_cost_usd": 0.0,
+            "calls_count": 0,
+            **generation_metadata,
+        }
+        return generated_files, usage
 
     @staticmethod
     def _validate_generated_server(

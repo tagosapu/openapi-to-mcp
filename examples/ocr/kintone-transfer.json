@@ -1,0 +1,70 @@
+{
+  "app": 1,
+  "records": [
+    {
+      "document_id": "ocr-e2e-001",
+      "text": "OCR transfer text\nInvoice total: 12800",
+      "status": "registered",
+      "confidence": 0.98,
+      "source_file": "invoice-001.png"
+    },
+    {
+      "document_id": "ocr-e2e-002",
+      "text": "請求書番号: INV-2026-002\n合計金額: 45000円",
+      "status": "registered",
+      "confidence": 0.91,
+      "source_file": "invoice-002.png"
+    },
+    {
+      "document_id": "ocr-e2e-003",
+      "text": "Low-confidence OCR result",
+      "status": "needs_review",
+      "confidence": 0.42,
+      "note": "手動確認が必要"
+    }
+  ],
+  "abnormal_records": [
+    {
+      "case": "missing_document_id",
+      "record": {
+        "document_id": "",
+        "text": "OCR text without document id",
+        "status": "registered",
+        "confidence": 0.88
+      },
+      "expected_error": {
+        "status_code": 400,
+        "target_code": "MOCK_RE02",
+        "message": "document_id is required"
+      }
+    },
+    {
+      "case": "unsupported_status",
+      "record": {
+        "document_id": "ocr-invalid-status",
+        "text": "OCR text with an unsupported status",
+        "status": "unknown",
+        "confidence": 0.77
+      },
+      "expected_error": {
+        "status_code": 400,
+        "target_code": "MOCK_RE03",
+        "message": "status must be one of: registered, needs_review, processed"
+      }
+    },
+    {
+      "case": "confidence_out_of_range",
+      "record": {
+        "document_id": "ocr-invalid-confidence",
+        "text": "OCR text with an invalid confidence",
+        "status": "registered",
+        "confidence": 1.2
+      },
+      "expected_error": {
+        "status_code": 400,
+        "target_code": "MOCK_RE03",
+        "message": "confidence must be between 0 and 1"
+      }
+    }
+  ]
+}

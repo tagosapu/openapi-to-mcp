@@ -973,6 +973,7 @@ async def _generate_mcp_server(
         logger.info("🔍 Step 6: Verifying generated files...")
         expected_files = [
             "server.py",
+            "runtime.py",
             "client.py",
             "requirements.txt",
             "README.md",

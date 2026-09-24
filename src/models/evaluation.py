@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 # Configure logging with basicConfig
 logging.basicConfig(
@@ -380,10 +380,12 @@ class OpenAPIEvaluationResult(BaseModel):
         """Alias for linting_results for backward compatibility."""
         return self.linting_results
 
-    model_config = {
-        "str_strip_whitespace": True,
-        "json_encoders": {datetime: lambda v: v.isoformat()},
-    }
+    model_config = {"str_strip_whitespace": True}
+
+    @field_serializer("evaluation_timestamp", "timestamp", when_used="json")
+    def serialize_timestamps(self, value: datetime) -> str:
+        """Serialize evaluation timestamps without deprecated json_encoders."""
+        return value.isoformat()
 
     def get_summary(self) -> Dict[str, Any]:
         """Get a summary of the evaluation results."""

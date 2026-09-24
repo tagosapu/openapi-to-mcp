@@ -30,6 +30,7 @@ _records: dict[str, dict[str, dict[str, Any]]] = {}
 _next_ids: dict[str, int] = {}
 _revisions: dict[str, int] = {}
 _request_log: list[dict[str, Any]] = []
+_TRANSFER_STATUSES = {"registered", "needs_review", "processed"}
 
 
 class RecordUpdate(BaseModel):
@@ -59,10 +60,16 @@ def _app_id(value: str | int) -> str:
     return str(value)
 
 
-def _error(status_code: int, code: str, message: str) -> JSONResponse:
+def _error(
+    status_code: int,
+    code: str,
+    message: str,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={"code": code, "id": "mock-error", "message": message},
+        headers=headers,
     )
 
 
@@ -231,6 +238,45 @@ def _record_update_target(
     return None, None
 
 
+def _validate_transfer_record(record: Any) -> JSONResponse | None:
+    if not isinstance(record, dict):
+        return _error(400, "MOCK_RE02", "record must be an object")
+    if not any(
+        field_code in record
+        for field_code in ("document_id", "text", "confidence", "source_file", "note")
+    ):
+        return None
+
+    for field_code in ("document_id", "text", "status"):
+        field = record.get(field_code)
+        value = field.get("value") if isinstance(field, dict) else None
+        if not isinstance(value, str) or not value.strip():
+            return _error(400, "MOCK_RE02", f"{field_code} is required")
+
+    status_value = record["status"]["value"]
+    if status_value not in _TRANSFER_STATUSES:
+        allowed = ", ".join(sorted(_TRANSFER_STATUSES - {"processed"}, key=lambda value: (value != "registered", value)))
+        allowed = f"{allowed}, processed"
+        return _error(
+            400,
+            "MOCK_RE03",
+            f"status must be one of: {allowed}",
+        )
+
+    confidence = record.get("confidence")
+    if confidence is not None:
+        confidence_value = confidence.get("value") if isinstance(confidence, dict) else None
+        if isinstance(confidence_value, bool):
+            return _error(400, "MOCK_RE03", "confidence must be between 0 and 1")
+        try:
+            numeric_confidence = float(confidence_value)
+        except (TypeError, ValueError):
+            return _error(400, "MOCK_RE03", "confidence must be between 0 and 1")
+        if not 0 <= numeric_confidence <= 1:
+            return _error(400, "MOCK_RE03", "confidence must be between 0 and 1")
+    return None
+
+
 async def _check_token(
     api_token: str | None = Header(default=None, alias="X-Cybozu-API-Token"),
 ) -> JSONResponse | None:
@@ -302,9 +348,16 @@ async def post_records(
         _records[app_id] = {}
         _next_ids[app_id] = 1
         _revisions[app_id] = 1
+    source_records = payload.get("records", [])
+    if not isinstance(source_records, list):
+        return _error(400, "MOCK_RE02", "records must be an array")
+    for source_record in source_records:
+        validation_error = _validate_transfer_record(source_record)
+        if validation_error:
+            return validation_error
     ids: list[str] = []
     revisions: list[str] = []
-    for source_record in payload.get("records", []):
+    for source_record in source_records:
         record_id = _next_record_id(app_id)
         revision = _bump_revision(app_id)
         _records[app_id][record_id] = {
@@ -421,6 +474,19 @@ async def get_apps(
 @app.get("/__mock/health")
 def mock_health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/__mock/errors/{status_code}")
+def mock_error(status_code: int) -> JSONResponse:
+    if status_code not in {401, 404, 409, 429, 500}:
+        return _error(400, "MOCK_400", "unsupported simulated status")
+    headers = {"Retry-After": "1"} if status_code == 429 else None
+    return _error(
+        status_code,
+        f"MOCK_{status_code}",
+        f"simulated status {status_code}",
+        headers=headers,
+    )
 
 
 @app.get("/__mock/requests")

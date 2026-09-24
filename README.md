@@ -5,252 +5,163 @@
 [![MCP](https://img.shields.io/badge/MCP-Compatible-green)](https://github.com/modelcontextprotocol)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-> Transform your OpenAPI specifications into production-ready Model Context Protocol (MCP) servers with AI-powered enhancement and validation
-
-**OpenAPI to MCP** is a powerful tool that automatically converts OpenAPI/Swagger specifications into fully functional MCP servers. It leverages Large Language Models (LLMs) to analyze, enhance, and generate MCP-compatible server implementations from your existing API documentation.
+OpenAPI / Swagger仕様から、実際にAPIを呼び出せるMCP serverとMCP clientを生成するツールです。LLMによる評価・仕様改善に加えて、同じ入力から同じMCP toolを生成する決定的なコード生成にも対応しています。
 
 > [!CAUTION]
-> The examples provided in this repository are for experimental and educational purposes only. They demonstrate concepts and techniques but are not intended for direct use in production environments. Make sure to have Amazon Bedrock Guardrails in place to protect against [prompt injection](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-injection.html). 
+> 付属の例は検証・学習用です。本番利用前に、生成コード、認証、入力検証、レート制限、ログの秘匿性を必ず確認してください。LLMを利用する場合は、プロンプトインジェクション対策も設定してください。
 
+## 目次
 
-## Table of Contents
+- [主な機能](#主な機能)
+- [アーキテクチャ](docs/ARCHITECTURE.md)
+- [前提条件](#前提条件)
+- [インストール](#インストール)
+- [基本的な使い方](#基本的な使い方)
+- [コマンドラインオプション](#コマンドラインオプション)
+- [環境変数](#環境変数)
+- [OCR転送API](#ocr転送api)
+- [Kintone MCPモック検証](#kintone-mcpモック検証)
+- [サンプルAPI](#サンプルapi)
+- [設定](#設定)
+- [生成物と結果](#生成物と結果)
+- [LLMプロバイダー](#llmプロバイダー)
+- [開発とテスト](#開発とテスト)
+- [セキュリティ](#セキュリティ)
+- [ライセンス](#ライセンス)
 
-- [What's New](#whats-new)
-- [Why This Solution](#why-this-solution)
-- [Architecture](#architecture)
-- [Features](#features)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Usage](#usage)
-  - [Basic Usage](#basic-usage)
-  - [Command Line Options](#command-line-options)
-  - [Environment Variables](#environment-variables)
-- [OCR Transfer API](#ocr-transfer-api)
-- [Examples](#examples)
-- [Configuration](#configuration)
-- [Output Structure](#output-structure)
-- [AI Providers](#ai-providers)
-- [Contributing](#contributing)
-- [Security](#security)
-- [License](#license)
+## 主な機能
 
-## What's New
+- OpenAPI 3.xとSwagger 2.0の読み込み
+- OpenAPI operationごとのMCP tool生成
+- OpenAPI参照（`$ref`）を含むパラメータ・request bodyの正規化
+- API key、Bearer / OAuth、Basic認証の生成
+- HTTPエラー、接続エラー、timeout、JSON解析エラーの構造化
+- 認証tokenやパスワードをエラー・履歴へ出さない秘匿処理
+- Amazon Bedrock、Anthropic、Azure OpenAIを使った評価・仕様改善
+- 評価結果、利用量、生成ソース、tool仕様の保存
+- ローカルKintone互換mockを使った転記E2E検証
 
-### v0.1.0
-- Initial release with core functionality
-- Support for OpenAPI 3.0 and Swagger 2.0 specifications
-- AI-powered evaluation and enhancement
-- Automatic MCP server and client generation
-- Support for Amazon Bedrock and Anthropic Claude
-- Comprehensive evaluation reports with usage tracking
+LLM評価を使わない場合でも、仕様からoperationを正規化してMCP server / clientを決定的に生成できます。生成されたserverは各operationを1つのMCP toolとして公開します。
 
-## Why This Solution
+## アーキテクチャ
 
-As enterprises transition towards being AI-ready, a critical piece of the puzzle is ensuring their APIs are AI-ready as well. API specifications that were written for human consumption often lack the level of detail that Large Language Models require for reliable operation. While human developers can rely on domain expertise and tribal knowledge to fill in documentation gaps, LLMs may hallucinate missing information, leading to AI agents that cannot reliably invoke the right tools at the right time.
+構成、生成フロー、認証、HTTP runtime、構造化エラー、Kintone転記経路の詳細は
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) にまとめています。
 
-Common issues in human-oriented API documentation that impact AI readiness include:
+要点は、OpenAPIのAPI操作を整理して操作ごとに1つのMCPツールを生成し、
+生成MCPサーバーの共通HTTP呼び出し部分から呼び出し先APIを呼ぶ構成です。通常経路は
+決まった手順でコードを生成し、生成後にAPI操作数・MCPツール数・構文・fallback有無を検証します。
 
-- **Missing or vague descriptions**: Endpoints and parameters that lack detailed explanations of their purpose and behavior
-- **Undefined parameter constraints**: Parameters without clearly defined ranges, formats, or validation rules
-- **Incomplete error handling**: Missing documentation for error responses and edge cases
-- **Unclear data relationships**: Lack of explicit documentation about how different API resources relate to each other
-- **Missing pagination details**: APIs that handle large datasets but don't clearly document pagination mechanisms
-- **Ambiguous filtering options**: Query parameters for filtering that lack comprehensive documentation
-- **Implicit business logic**: Assumptions about workflow and usage patterns that aren't explicitly documented
+## 前提条件
 
-When these incomplete API specifications are directly converted to MCP servers, the resulting tool specifications inherit the same deficiencies. This leads to unpredictable behavior that may be sub-optimal at best and completely broken at worst. The OpenAPI to MCP Converter addresses this gap by using AI to analyze, evaluate, and enhance your API specifications before generating MCP servers, ensuring they meet the quality standards required for reliable AI agent operation.
+- Python 3.11以上
+- [uv](https://github.com/astral-sh/uv)
+- LLM評価を使う場合は、選択したプロバイダーの認証情報
+  - Amazon Bedrock: AWS profile / region
+  - Anthropic: API key
+  - Azure OpenAI: endpoint、API key、deployment名、API version
 
-## Architecture
+## インストール
 
-The OpenAPI to MCP Converter follows a multi-stage pipeline architecture:
+### uvのインストール
 
-```mermaid
-graph TD
-    A[OpenAPI Spec] --> B[Specification Loader]
-    B --> C[AI-Powered Evaluator]
-    C --> D{Quality Check}
-    D -->|Pass| E[MCP Generator]
-    D -->|Fail| F[Enhancement Suggestions]
-    E --> G[MCP Server]
-    E --> H[MCP Client]
-    F --> I[Enhanced Spec]
-    
-    J[LLM Provider] --> C
-    J --> E
-    
-    style A fill:#f9f,stroke:#333,stroke-width:2px
-    style G fill:#9f9,stroke:#333,stroke-width:2px
-    style H fill:#9f9,stroke:#333,stroke-width:2px
-```
-
-### Key Components
-
-1. **Specification Loader**: Loads and validates OpenAPI/Swagger specifications from files or URLs
-2. **AI-Powered Evaluator**: Uses LLMs to analyze API quality, completeness, and AI-readiness
-3. **Enhancement Engine**: Provides actionable suggestions to improve your API specification
-4. **MCP Generator**: Creates production-ready MCP server and client implementations
-5. **Output Manager**: Organizes all generated files and reports in a structured format
-
-## Features
-
-### Core Features
-
-The OpenAPI to MCP Converter provides a seamless bridge between your existing API documentation and the Model Context Protocol ecosystem. With just a single command, you can transform any OpenAPI or Swagger specification into a production-ready MCP server. The tool leverages advanced Large Language Models to not only convert but also analyze and enhance your API specifications, ensuring they meet the highest standards for AI integration.
-
-Every conversion includes comprehensive evaluation reports that score your API across multiple dimensions including completeness, security, and AI-readiness. The built-in quality thresholds ensure that only specifications meeting your standards proceed to MCP generation, while detailed usage tracking helps you monitor LLM token consumption and associated costs across all operations.
-
-### Evaluation Capabilities
-
-The evaluation engine performs deep analysis of your OpenAPI specifications across multiple dimensions. It checks for API completeness by identifying missing descriptions, examples, and schemas that could impact usability. Security analysis evaluates your authentication and authorization schemes to ensure they meet modern security standards.
-
-The AI readiness assessment is particularly valuable, determining how effectively your API will work with AI agents and automation tools. Built-in linting identifies specification issues and violations of OpenAPI best practices, while the operation analysis provides detailed reviews of each endpoint including parameter documentation, response schemas, and error handling.
-
-### Generation Features
-
-When your specification meets the quality thresholds, the tool generates a complete MCP implementation package. This includes a fully functional Python-based MCP server that implements all your API operations as MCP tools, along with a ready-to-use client for testing your implementation.
-
-The generated package includes all necessary dependency files, comprehensive documentation with usage instructions, and detailed tool specifications that describe each operation in MCP format. Everything is organized in a clean directory structure, ready for deployment or further customization.
-
-## Example Results & Output Guide
-
-Want to see what the converter produces? Check out our pre-generated example results and comprehensive output guide:
-
-**[Explore Example Results](examples/results/anthropic/sample_api/)** - See real evaluation reports, generated MCP servers, and more from our sample space mission API
-
-**[Read the Results Guide](docs/RESULTS_GUIDE.md)** - Understand every file the converter generates, with links to actual examples
-
-These resources show you exactly what to expect from the conversion process and help you interpret the evaluation scores and generated code.
-
-## Prerequisites
-
-- Python 3.12 or higher
-- [uv](https://github.com/astral-sh/uv) package manager
-- Valid API credentials for your chosen LLM provider:
-  - Amazon Bedrock credentials (for Claude via Bedrock)
-  - Anthropic API key (for direct Claude access)
-  - Azure OpenAI API key, endpoint, and API version
-
-## Installation
-
-### Installing uv
-
-First, install the uv package manager if you haven't already:
+macOS / Linux:
 
 ```bash
-# On macOS and Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# On Windows
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# Or using pip
-pip install uv
 ```
 
-### Quick Install
+Windows PowerShell:
 
-1. Clone the repository:
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+### プロジェクトのセットアップ
+
 ```bash
 git clone https://github.com/agentic-community/openapi-to-mcp.git
 cd openapi-to-mcp
-```
-
-2. Create and activate a virtual environment:
-```bash
-# Create virtual environment
-uv venv
-
-# Activate on macOS/Linux
-source .venv/bin/activate
-
-# Activate on Windows
-.venv\Scripts\activate
-```
-
-3. Install dependencies using uv:
-```bash
-uv pip install -e .
-```
-
-4. Set up your environment variables:
-```bash
+uv sync --extra dev
 cp env.example .env
-# Edit .env with your API credentials
 ```
 
-### Development Installation
+`.env` には実際のsecretをコミットしないでください。アプリケーションコードから`.env`を直接読み込まず、既存の設定ローダーと環境変数を使用します。
 
-For development with additional tools:
+## 基本的な使い方
+
+ローカルのOpenAPI仕様を評価・変換します。
+
 ```bash
-uv pip install -e ".[dev]"
-```
-
-## Usage
-
-### Basic Usage
-
-Evaluate and convert a local OpenAPI specification:
-```bash
-# For a simple example
 openapi-to-mcp examples/hello.yaml
-
-# For a more complex example
 openapi-to-mcp examples/sample_api.yaml
 ```
 
-Evaluate a specification from a URL:
+URLから仕様を取得します。
+
 ```bash
 openapi-to-mcp --url https://raw.githubusercontent.com/agentic-community/openapi-to-mcp/refs/heads/main/examples/hello.yaml
 ```
 
-### Command Line Options
+評価だけを実行し、MCP生成を省略します。
 
 ```bash
-openapi-to-mcp [OPTIONS] [FILENAME]
-
-Arguments:
-  FILENAME              OpenAPI specification file (YAML or JSON)
-
-Options:
-  --url URL            URL to fetch OpenAPI specification from
-  --output FILE        Output file for results (default: auto-generated)
-  --eval-only         Only run evaluation, skip MCP generation
-  --verbose           Enable verbose logging
-  --show-env          Show environment configuration
+openapi-to-mcp examples/sample_api.yaml --eval-only
 ```
 
-### Environment Variables
+出力先を指定します。
 
-Configure your LLM provider credentials through environment variables:
+```bash
+openapi-to-mcp examples/hello.yaml --output results/my-api-evaluation.json
+```
 
-#### For Amazon Bedrock:
+## コマンドラインオプション
+
+```text
+openapi-to-mcp [OPTIONS] [FILENAME]
+
+引数:
+  FILENAME              OpenAPI仕様ファイル（YAMLまたはJSON）
+
+オプション:
+  --url URL              OpenAPI仕様を取得するURL
+  --output FILE          結果の出力先
+  --eval-only            評価だけを実行し、MCP生成を省略
+  --verbose              詳細ログを有効化
+  --show-env             環境設定を表示
+```
+
+## 環境変数
+
+### Amazon Bedrock
+
 ```bash
 export AWS_PROFILE=your-profile-name
 export AWS_REGION=us-east-1
 ```
 
-#### For Anthropic Direct:
+### Anthropic
+
 ```bash
 export ANTHROPIC_API_KEY=your-api-key
 ```
 
-The model selection is read from `MODEL` when it is set in `.env`. For the direct Azure OpenAI SDK convention, `VISION_MODEL` is used when `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_API_KEY` are set; otherwise the value in `config/config.yml` is used.
+### Azure OpenAI
 
-#### For Azure OpenAI:
 ```bash
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
-AZURE_OPENAI_API_KEY=your-api-key
-VISION_MODEL=your-deployment-name
-AZURE_OPENAI_API_VERSION=2024-10-21
+export AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+export AZURE_OPENAI_API_KEY=your-api-key
+export VISION_MODEL=your-deployment-name
+export AZURE_OPENAI_API_VERSION=2024-10-21
 ```
 
-`VISION_MODEL` must match the deployment name configured in Azure OpenAI. The alternative `MODEL=azure/your-deployment-name` format is also supported.
+`.env`の`MODEL`でモデルを選択できます。Azure OpenAIを直接使う場合は、`AZURE_OPENAI_ENDPOINT`と`AZURE_OPENAI_API_KEY`が設定されているときに`VISION_MODEL`のdeployment名を使います。`MODEL=azure/your-deployment-name`形式も利用できます。
 
-## OCR Transfer API
+## OCR転送API
 
-The OCR transfer service accepts the canonical `ocr-transfer/v1` JSON contract and delivers one document at a time through a registered REST/OpenAPI connector. It validates caller JWTs against an existing identity provider; this repository does not provide a local token issuer.
+OCR転送サービスは、標準化された`ocr-transfer/v1` JSONを受け取り、登録済みのREST / OpenAPI connectorへ1文書ずつ配信します。JWTの検証は既存のidentity providerに対して行い、このリポジトリはtoken issuerを提供しません。
 
-Copy `env.example` to `.env` and set these server-side values before starting the service:
+サーバー側の設定例です。
 
 ```dotenv
 TRANSFER_DATABASE_PATH=./data/transfer.sqlite3
@@ -268,459 +179,226 @@ TRANSFER_DATA_ENCRYPTION_KEY_REF=key://transfer/data
 TRANSFER_CREDENTIALS_JSON={"tenants":{"tenant-a":{"vault://connectors/invoice-target":{"auth":"REPLACE_WITH_TARGET_SECRET"}}},"global":{"config://headers/target-api-version":{"value":"2026-01-01"},"key://transfer/data":"REPLACE_WITH_FERNET_KEY"}}
 ```
 
-`TRANSFER_CREDENTIALS_JSON` is the resolver input: connector `credential_ref`
-values select a bundle inside the authenticated tenant, while `config://...`
-values in `global` provide non-secret connector headers and the `global`
-`key://...` entry supplies the Fernet key referenced by
-`TRANSFER_DATA_ENCRYPTION_KEY_REF`. Keep the
-replacement values in a protected environment or secret manager. The retention
-settings in `env.example` control idempotency, payload, and audit retention and
-have defaults.
+`TRANSFER_CREDENTIALS_JSON`はcredential resolverの入力です。connectorの`credential_ref`が認証bundleを選択し、`global`内の`config://...`がsecretではないconnector headerを提供します。secretはOpenAPI、mapping、OCR JSONへ入れず、環境変数またはsecret managerで管理してください。
 
-`TRANSFER_TEST_TOKEN` is a client-side variable containing an already-issued JWT, not a token that the service creates. The JWT must contain `iss`, `aud`, `exp`, `sub`, and `tenant_id` claims; `tenant_id` must match the transfer metadata, and `sub` identifies the caller. The setup and transfer commands below need `connector:admin`, `connector:read`, `mapping:write`, `mapping:read`, `transfer:write`, and `transfer:read` scopes. Reconciliation commands additionally need `transfer:reconcile`.
-
-Start the service with:
+すでに発行済みのJWTを`TRANSFER_TEST_TOKEN`へ設定してサービスを起動します。
 
 ```bash
 uv run ocr-transfer-api --host 127.0.0.1 --port 8080
 ```
 
-Register a connector with `POST /v1/connectors` using an inline, secret-free OpenAPI snapshot. The snapshot must include the operation bindings extension for `create`, `update`, and `upsert`. The following creates a request file from a JSON snapshot at a placeholder path; the snapshot must define those bindings and the target schema referenced by the mapping. Replace the base URL and allowed host with the real target host, but do not put target credentials in the snapshot:
+connector、mapping、transferの登録例は、実際のtarget OpenAPI snapshotとsecret-freeなmappingを使う必要があります。標準OCR入力の例は [examples/ocr/invoice-transfer.json](examples/ocr/invoice-transfer.json) と [examples/ocr/invoice-transfer-alt.json](examples/ocr/invoice-transfer-alt.json) です。
+
+## Kintone MCPモック検証
+
+ローカルKintone互換mockを使い、OCRデータの転記から取得・更新・削除、異常データ拒否、HTTPエラー、通信エラー、token秘匿まで検証できます。実Kintoneには接続しません。
+
+fixtureは [examples/ocr/kintone-transfer.json](examples/ocr/kintone-transfer.json) です。正常データ3件を含みます。
+
+| document_id | status | confidence | 内容 |
+| --- | --- | ---: | --- |
+| `ocr-e2e-001` | `registered` | `0.98` | 英数字の請求書テキスト |
+| `ocr-e2e-002` | `registered` | `0.91` | 日本語の請求書テキスト |
+| `ocr-e2e-003` | `needs_review` | `0.42` | 手動確認が必要な低信頼度データ |
+
+異常データもfixtureに3件あります。
+
+| case | 異常内容 | 応答 |
+| --- | --- | --- |
+| `missing_document_id` | document IDが空 | `400 / MOCK_RE02` |
+| `unsupported_status` | statusが`unknown` | `400 / MOCK_RE03` |
+| `confidence_out_of_range` | confidenceが`1.2` | `400 / MOCK_RE03` |
+
+### 3つの端末で実行する場合
+
+端末1でmockを起動します。
 
 ```bash
-export TRANSFER_TEST_TOKEN=REPLACE_WITH_AN_ALREADY_ISSUED_JWT
-export TARGET_OPENAPI_JSON=/path/to/target-openapi.json
-
-jq --slurpfile target_spec "$TARGET_OPENAPI_JSON" '{
-  "connector_id": "invoice-target",
-  "type": "rest-openapi",
-  "display_name": "Invoice target",
-  "base_url": "https://target.example.com/",
-  "spec": $target_spec[0],
-  "credential_ref": "vault://connectors/invoice-target",
-  "additional_headers": [
-    {"name": "X-Api-Version", "value_ref": "config://headers/target-api-version"}
-  ],
-  "policy": {
-    "connect_timeout_seconds": 5,
-    "read_timeout_seconds": 30,
-    "total_timeout_seconds": 60,
-    "max_response_bytes": 1048576,
-    "max_redirects": 0
-  }
-}' > /tmp/invoice-connector-registration.json
-
-curl \
-  -H "Authorization: Bearer ${TRANSFER_TEST_TOKEN}" \
-  -H "Content-Type: application/json" \
-  --data @/tmp/invoice-connector-registration.json \
-  http://127.0.0.1:8080/v1/connectors
+uv run python examples/kintone_stub_server.py --port 9100 --token mock-token
 ```
 
-Register a published mapping whose `connector_id`, operations, deduplication path, and `target_schema_ref` match that snapshot. This request is secret-free; save it as `/tmp/invoice-mapping.json` or use an equivalent file path:
+端末2で生成MCP serverを起動します。
 
 ```bash
-cat > /tmp/invoice-mapping.json <<'JSON'
-{
-  "mapping_id": "invoice-v1",
-  "version": 1,
-  "status": "published",
-  "connector_id": "invoice-target",
-  "document_types": ["invoice"],
-  "operations": ["create", "update", "upsert"],
-  "deduplication_key_path": "/ocr/fields/invoice_number/value",
-  "target_schema_ref": "openapi:#/components/schemas/InvoiceUpsertRequest",
-  "rules": [
-    {
-      "rule_id": "external-id-body",
-      "source": "/ocr/fields/invoice_number/value",
-      "target": {"location": "body", "pointer": "/external_id"},
-      "required": true,
-      "on_missing": "error",
-      "transforms": []
-    },
-    {
-      "rule_id": "external-id-path",
-      "source": "/ocr/fields/invoice_number/value",
-      "target": {"location": "path", "name": "external_id"},
-      "required": true,
-      "on_missing": "error",
-      "transforms": []
-    },
-    {
-      "rule_id": "invoice-number",
-      "source": "/ocr/fields/invoice_number/value",
-      "target": {"location": "body", "pointer": "/invoice_number"},
-      "required": true,
-      "on_missing": "error",
-      "transforms": []
-    },
-    {
-      "rule_id": "total-amount",
-      "source": "/ocr/fields/total_amount/value",
-      "target": {"location": "body", "pointer": "/total_amount"},
-      "required": true,
-      "on_missing": "error",
-      "transforms": []
-    },
-    {
-      "rule_id": "source-document",
-      "source": "/document/document_id",
-      "target": {"location": "body", "pointer": "/source_document_id"},
-      "required": true,
-      "on_missing": "error",
-      "transforms": []
-    }
-  ]
-}
-JSON
-
-curl \
-  -H "Authorization: Bearer ${TRANSFER_TEST_TOKEN}" \
-  -H "Content-Type: application/json" \
-  --data @/tmp/invoice-mapping.json \
-  http://127.0.0.1:8080/v1/mappings
+API_BASE_URL=http://127.0.0.1:9100 \
+KINTONE_API_TOKEN=mock-token \
+uv run python results/azure/openapi/mcpserver/server.py \
+  --port 9001 --transport streamable-http
 ```
 
-Credential values stay in the configured resolver and never belong in the OpenAPI, mapping, or OCR JSON. The mapping above assumes the target snapshot exposes `InvoiceUpsertRequest`; use the component name and binding paths from the target API instead of copying it blindly.
-
-Submit a secret-free standard OCR document after registration:
+端末3で正常データの1件目を送信します。
 
 ```bash
-curl \
-  -H "Authorization: Bearer ${TRANSFER_TEST_TOKEN}" \
-  -H "Idempotency-Key: invoice-0001" \
-  -H "Content-Type: application/json" \
-  -d @examples/ocr/invoice-transfer.json \
-  http://127.0.0.1:8080/v1/transfers
+uv run python results/azure/openapi/mcpserver/client.py \
+  --server-url http://127.0.0.1:9001/mcp/ \
+  --tool postRecords \
+  --arguments '{"body":{"app":1,"records":[{"document_id":{"type":"SINGLE_LINE_TEXT","value":"ocr-e2e-001"},"text":{"type":"MULTI_LINE_TEXT","value":"OCR transfer text\nInvoice total: 12800"},"status":{"type":"DROP_DOWN","value":"registered"},"confidence":{"type":"NUMBER","value":0.98},"source_file":{"type":"SINGLE_LINE_TEXT","value":"invoice-001.png"}}]}}'
 ```
 
-Use the returned `transfer_id` with `GET /v1/transfers/{transfer_id}`. A delivery with an unknown outcome is held in `reconciliation_required`; it is not automatically resent. Internal worker reconciliation may perform an automatic target lookup, but the public reconcile endpoint records operator evidence. An operator can confirm a resource, confirm it is absent so the queued transfer may be resent, or leave it unresolved; `unresolved` keeps the transfer in `reconciliation_required` and does not resend it:
+正常データ3件と異常データ3件をまとめて検証する場合は、次のE2Eを実行します。
 
 ```bash
-curl \
-  -H "Authorization: Bearer ${TRANSFER_TEST_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"resolution":"confirmed_absent","notes":"verified in the target API"}' \
-  http://127.0.0.1:8080/v1/transfers/TRANSFER_ID/reconcile
+uv run pytest tests/test_kintone_stub_server.py tests/test_kintone_mcp_e2e.py -q
 ```
 
-The repository includes two standard OCR inputs at [examples/ocr/invoice-transfer.json](examples/ocr/invoice-transfer.json) and [examples/ocr/invoice-transfer-alt.json](examples/ocr/invoice-transfer-alt.json). Run the complete test suite with:
+現在の実測結果は次のとおりです。
+
+```text
+11 passed, 1 warning
+```
+
+実際の入力JSON、Kintone field形式への変換、登録応答、取得結果、異常応答、404、接続エラーは [docs/KINTONE_MCP_MOCK_RESULTS.md](docs/KINTONE_MCP_MOCK_RESULTS.md) に掲載しています。Pydanticのwarningはなく、残るwarningはStarlette / AnyIO依存関係由来です。
+
+request historyは次で取得できます。
+
+```bash
+curl http://127.0.0.1:9100/__mock/requests
+```
+
+historyには`X-Cybozu-API-Token`が存在したかどうかだけを記録し、token値は記録しません。
+
+## サンプルAPI
+
+### 付属のsample API
+
+`examples/sample_api.yaml`は、宇宙船のtelemetry、crew、mission、scientific experimentを持つサンプルAPIです。stub serverと生成済みMCP serverを使って一連の呼び出しを確認できます。
+
+結果のサンプルは `examples/results/anthropic/sample_api/` にあります。生成されるファイルの意味は [docs/RESULTS_GUIDE.md](docs/RESULTS_GUIDE.md) を参照してください。
+
+```bash
+# 端末1: stub server
+uv run python examples/stub_server.py --port 9002
+
+# 端末2: 生成MCP server
+export AUTH_TOKEN="your-secret-token"
+cd examples/results/anthropic/sample_api/mcpserver/
+python server.py --port 9001 --base-url http://localhost:9002
+
+# 端末3: MCP client
+python client.py --server-url http://localhost:9001/mcp
+```
+
+### その他の例
+
+```bash
+openapi-to-mcp examples/hello.yaml
+openapi-to-mcp examples/sample_api.yaml
+openapi-to-mcp --url https://raw.githubusercontent.com/agentic-community/openapi-to-mcp/refs/heads/main/examples/hello.yaml
+openapi-to-mcp examples/sample_api.yaml --eval-only
+openapi-to-mcp examples/hello.yaml --output results/my-api-evaluation.json
+```
+
+## 設定
+
+設定ファイルは [config/config.yml](config/config.yml) です。
+
+```yaml
+model: bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0
+# Anthropicを直接使う場合:
+# model: anthropic/claude-3-5-sonnet-20241022
+max_tokens: 8192
+temperature: 0.0
+timeout_seconds: 300
+good_evaluation_threshold: 3.0
+generate_mcp_threshold: 3.0
+debug: false
+```
+
+`good_evaluation_threshold`は評価を良好と判定する最低点、`generate_mcp_threshold`はMCP生成を許可する最低点です。通常は完全性とAI利用適性の両方がしきい値以上である必要があります。
+
+## 生成物と結果
+
+通常の出力は次の構成です。
+
+```text
+output/
+└── results_YYYYMMDD_HHMMSS_<spec-name>_<provider>/
+    ├── evaluation_YYYYMMDD_HHMMSS.json
+    ├── summary_YYYYMMDD_HHMMSS.md
+    ├── usage_YYYYMMDD_HHMMSS.json
+    ├── enhanced_spec_YYYYMMDD_HHMMSS.yaml
+    ├── original_spec_YYYYMMDD_HHMMSS.yaml
+    └── mcpserver/
+        ├── server.py
+        ├── client.py
+        ├── requirements.txt
+        ├── README.md
+        └── tool_spec.txt
+```
+
+- `evaluation_*.json`: completeness、security、AI readinessなどの評価結果
+- `summary_*.md`: 人が読むための評価要約
+- `usage_*.json`: token使用量とコスト
+- `enhanced_spec_*.yaml`: 改善後のOpenAPI仕様
+- `mcpserver/`: MCP server、client、tool仕様、依存関係、利用方法
+
+生成済みサンプルの読み方は [docs/RESULTS_GUIDE.md](docs/RESULTS_GUIDE.md) を参照してください。
+
+## LLMプロバイダー
+
+LiteLLMを通じて次のプロバイダーを利用できます。
+
+- Amazon Bedrock: `bedrock/` prefixのモデル
+- Anthropic Direct: `anthropic/` prefixのモデル
+- Azure OpenAI: `azure/` prefixまたはAzure用の環境変数
+
+実際に利用するモデルとdeployment名は、環境変数と `config/config.yml` の設定に合わせてください。API keyやAWS credentialをログ、仕様ファイル、fixtureへ書き込まないでください。
+
+## 開発とテスト
+
+依存関係を同期します。
+
+```bash
+uv sync --extra dev
+```
+
+全テスト:
 
 ```bash
 uv run pytest -q
 ```
 
-## Examples
-
-### Example 1: Evaluate a Simple API
+特定のテスト:
 
 ```bash
-# Evaluate the simple hello API example
-openapi-to-mcp examples/hello.yaml
-
-# Check the generated output
-ls output/results_*_hello/
-```
-
-### Example 2: Evaluate a Complex API
-
-```bash
-# Evaluate the more complex sample API with multiple endpoints
-openapi-to-mcp examples/sample_api.yaml
-
-# This example includes operations for users, products, and more
-```
-
-### Example 3: Evaluate from URL
-
-```bash
-# Evaluate directly from a URL
-openapi-to-mcp --url https://raw.githubusercontent.com/agentic-community/openapi-to-mcp/refs/heads/main/examples/hello.yaml
-```
-
-### Example 4: Evaluate Only (No Generation)
-
-```bash
-# Just evaluate without generating MCP server
-openapi-to-mcp examples/sample_api.yaml --eval-only
-```
-
-### Example 5: Custom Output Location
-
-```bash
-# Specify custom output file
-openapi-to-mcp examples/hello.yaml --output results/my-api-evaluation.json
-```
-
-## Testing with Stub Server
-
-This repository includes a complete end-to-end demonstration using the `examples/sample_api.yaml` specification. The sample API represents a fictional space mission control system with endpoints for spaceship telemetry, crew management, mission operations, and scientific experiments.
-
-To facilitate testing without a real backend, we provide:
-- A stub server (`examples/stub_server.py`) that implements the backend API with simulated responses
-- Pre-generated MCP server and client code for immediate testing
-- A complete workflow to test the entire chain from API specification to working MCP tools
-
-### Pre-Generated Results
-
-For convenience, we've included pre-generated results from evaluating `sample_api.yaml` in:
-```
-examples/results/anthropic/sample_api/
-```
-
-This directory contains evaluation reports, enhanced specifications, and a ready-to-run MCP server. See [RESULTS_GUIDE.md](docs/RESULTS_GUIDE.md) for detailed information about these files.
-
-### Running the End-to-End Demo
-
-Follow these steps to test the complete integration:
-
-### Step 1: Start the Stub Server
-
-First, run the stub server that simulates your API backend:
-
-```bash
-# Start stub server on port 9002
-uv run examples/stub_server.py --port 9002
-```
-
-This creates a mock backend that responds to API requests with simulated data.
-
-### Step 2: Set Authentication Token
-
-Export the authentication token required by the MCP server:
-
-```bash
-export AUTH_TOKEN="your-secret-token"
-```
-
-### Step 3: Start the MCP Server
-
-In a new terminal, navigate to the generated MCP server directory and start it:
-
-```bash
-# Navigate to the generated server directory
-cd examples/results/anthropic/sample_api/mcpserver/
-
-# Start the MCP server on port 9001, pointing to stub server on port 9002
-python server.py --port 9001 --base-url http://localhost:9002
-```
-
-### Step 4: Test with the MCP Client
-
-In another terminal, run the MCP client to interact with your server:
-
-```bash
-# From the same mcpserver directory
-python client.py --server-url http://localhost:9001/mcp
-```
-
-The client will connect to the MCP server and allow you to test all the available tools.
-
-### Example Workflow
-
-```bash
-# Terminal 1: Start stub server
-uv run examples/stub_server.py --port 9002
-
-# Terminal 2: Set auth and start MCP server
-export AUTH_TOKEN="my-secret-token"
-cd examples/results/anthropic/sample_api/mcpserver/
-python server.py --port 9001 --base-url http://localhost:9002
-
-# Terminal 3: Run client
-cd examples/results/anthropic/sample_api/mcpserver/
-python client.py --server-url http://localhost:9001/mcp
-```
-
-## Configuration
-
-### Configuration File
-
-The tool uses `config/config.yml` for all settings including model selection:
-
-```yaml
-# Model configuration - specify your model here
-model: bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0
-# Or for Anthropic direct:
-# model: anthropic/claude-3-5-sonnet-20241022
-
-# Model parameters
-max_tokens: 8192
-temperature: 0.0
-timeout_seconds: 300
-
-# Evaluation thresholds
-good_evaluation_threshold: 3.0
-generate_mcp_threshold: 3.0
-
-# Feature flags
-debug: false
-```
-
-### Quality Thresholds
-
-- **good_evaluation_threshold**: Minimum score for "good" evaluation (default: 3/5)
-- **generate_mcp_threshold**: Minimum score to generate MCP server (default: 3/5)
-
-Both completeness and AI readiness scores must meet the threshold for MCP generation.
-
-## Output Structure
-
-After running the tool, you'll find the following structure:
-
-```
-output/
-└── results_YYYYMMDD_HHMMSS_<spec-name>_<provider>/
-    ├── evaluation_YYYYMMDD_HHMMSS.json      # Detailed evaluation results
-    ├── summary_YYYYMMDD_HHMMSS.md           # Human-readable summary
-    ├── usage_YYYYMMDD_HHMMSS.json           # Token usage and costs
-    ├── enhanced_spec_YYYYMMDD_HHMMSS.yaml   # Enhanced specification
-    ├── original_spec_YYYYMMDD_HHMMSS.yaml   # Original specification
-    └── mcpserver/                            # Generated MCP server (if criteria met)
-        ├── server.py                         # MCP server implementation
-        ├── client.py                         # MCP client for testing
-        ├── requirements.txt                  # Python dependencies
-        ├── README.md                         # Usage documentation
-        └── tool_spec.txt                     # Tool specifications
-```
-
-## Understanding the Results
-
-The OpenAPI to MCP Converter generates comprehensive evaluation reports and MCP implementations. To help you understand and work with these outputs:
-
-**[View the Results Guide](docs/RESULTS_GUIDE.md)**
-
-This guide explains:
-- What each generated file contains and its purpose
-- How to interpret evaluation scores and quality metrics
-- Understanding pagination and filtering support indicators
-- Working with the generated MCP server and client code
-- Links to example files from our pre-generated sample API results
-
-The pre-generated results in `examples/results/anthropic/sample_api/` serve as a reference implementation showing what a high-quality conversion looks like.
-
-## AI Providers
-
-### Supported Providers
-
-1. **Amazon Bedrock**
-   - Models: Claude 3.5 Sonnet, Claude 4 Sonnet
-   - Region support: All AWS regions with Bedrock
-   - Pricing: Pay per token via AWS
-
-2. **Anthropic (Direct)**
-   - Models: All Claude models
-   - Global availability
-   - Pricing: Pay per token via Anthropic
-
-### Provider Selection
-
-This solution uses [LiteLLM](https://github.com/BerriAI/litellm) for LLM provider management. The provider is automatically detected based on the prefix in the MODEL environment variable:
-
-- Models prefixed with `bedrock/` use Amazon Bedrock
-- Models prefixed with `anthropic/` use Anthropic directly
-- Without a prefix, the model defaults to Anthropic
-
-While LiteLLM supports many providers, this tool has been specifically tested and optimized for the Claude family of models through both Amazon Bedrock and Anthropic.
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
-
-### Development Setup
-
-1. Fork the repository
-2. Create a feature branch
-3. Install development dependencies: `uv pip install -e ".[dev]"`
-   - This installs pytest, black, ruff, and other development tools
-4. Make your changes
-5. Run tests and code quality checks
-6. Submit a pull request
-
-### Running Tests
-
-```bash
-# Run all tests
-uv run pytest
-
-# Run tests with coverage
-uv run pytest --cov=src --cov-report=html
-
-# Run specific test file
 uv run pytest tests/test_spec_loader.py
-
-# Run tests in verbose mode
-uv run pytest -v
+uv run pytest tests/test_kintone_stub_server.py tests/test_kintone_mcp_e2e.py -q
 ```
 
-### Code Quality Tools
+カバレッジ:
 
-#### Black (Code Formatting)
 ```bash
-# Format all Python files in src directory
-uv run black src
-
-# Check formatting without making changes
-uv run black --check src
-
-# Format specific file
-uv run black src/services/spec_loader.py
+uv run pytest --cov=src --cov-report=html
 ```
 
-#### Ruff (Linting)
+品質チェック:
+
 ```bash
-# Run linter on src directory
-uv run ruff check src
-
-# Fix auto-fixable issues
-uv run ruff check --fix src
-
-# Check specific file
-uv run ruff check src/services/spec_loader.py
+uv run black --check src tests
+uv run ruff check src tests
 ```
 
-#### Pre-commit Checks
-Run all quality checks before committing:
-```bash
-# Run black formatting
-uv run black src
+変更後は、テストと品質チェックが通過してからコミットしてください。実装を変更したときは、対応するテストも追加・更新してください。
 
-# Run ruff linting
-uv run ruff check --fix src
+## セキュリティ
 
-# Run tests
-uv run pytest
-```
+- OpenAPI仕様、OCR JSON、mappingにAPI key、password、JWT、個人情報を入れない
+- `.env`をコミットしない
+- tokenは環境変数またはsecret managerから読み込む
+- 生成されたserverの認証、入力検証、レート制限、redirect、ログをレビューする
+- エラー、request history、評価結果にsecretが含まれないことを確認する
+- LLMへ送る仕様に機密情報が含まれる場合は、送信先と保持ポリシーを確認する
 
-## Security
+脆弱性の報告方法は [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications) を参照してください。
 
-### Security Best Practices
+## ロードマップ
 
-When using this tool, please follow these security guidelines:
+大きなOpenAPI仕様に対して、LLMのcontext windowを超えないようpath単位で分割処理する機能を検討しています。
 
-1. **Sensitive Data in OpenAPI Specs**: Ensure that your OpenAPI specifications do not contain sensitive data such as real API keys, passwords, or personally identifiable information (PII) when testing with cloud-based LLM providers.
+## コントリビューション
 
-2. **Use Local Models for Sensitive Data**: If your OpenAPI specifications contain sensitive information, consider using locally hosted LLM models instead of third party model providers to maintain data privacy.
+変更を提案する場合は [CONTRIBUTING.md](CONTRIBUTING.md) を確認してください。小さな修正でも、再現手順とテスト結果をPull Requestに記載してください。
 
-3. **Security Testing of Generated Code**: Always thoroughly review and test the generated MCP server code for security vulnerabilities before deploying to production. This includes:
-   - Input validation and sanitization
-   - Authentication and authorization checks
-   - Rate limiting and abuse prevention
-   - Secure handling of API credentials
-   - Protection against common vulnerabilities (injection attacks, XSS, etc.)
+## ライセンス
 
-4. **Environment Variables**: Never commit `.env` files or expose API credentials in your code repository. Use secure credential management practices.
-
-### Reporting Security Issues
-
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for information on reporting security vulnerabilities in this project.
-
-## Roadmap
-
-### Large OpenAPI Specification Support
-- Implement path-based batch processing for handling large API specifications that exceed LLM context windows ([#1](https://github.com/agentic-community/openapi-to-mcp/issues/1))
-
-## License
-
-This project is licensed under the Apache-2.0 License. See [LICENSE](LICENSE) for details.
+このプロジェクトはApache-2.0 Licenseです。詳細は [LICENSE](LICENSE) と [NOTICE](NOTICE) を参照してください。
