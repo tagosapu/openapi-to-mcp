@@ -169,6 +169,7 @@ cython_debug/
 
 # Project specific
 output/
+.worktrees/
 # Ignore results directories everywhere except in examples
 results/
 !examples/results/
