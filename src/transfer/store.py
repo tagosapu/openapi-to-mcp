@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections.abc import Iterable
-from copy import deepcopy
-from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -35,9 +34,8 @@ from .models import (
     TransferResult,
     TransferStatus,
 )
-from .openapi_contract import public_spec_hash
 from .observability import SecretRedactor
-
+from .openapi_contract import public_spec_hash
 
 ALLOWED_TRANSITIONS = {
     TransferStatus.ACCEPTED: {
@@ -1865,7 +1863,7 @@ def _isoformat(value: datetime) -> str:
 def _parse_datetime(value: str | None) -> datetime | None:
     if value is None:
         return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return datetime.fromisoformat(value)
 
 
 def _utc_now() -> datetime:

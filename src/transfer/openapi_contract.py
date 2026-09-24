@@ -1,14 +1,21 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
 import json
 import re
+from copy import deepcopy
 from typing import Any, Literal
 
 from openapi_spec_validator import validate
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
-
+from openapi_spec_validator.exceptions import OpenAPIError
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+)
 
 HTTP_METHODS = {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
 
@@ -82,7 +89,7 @@ class ContractPreflight:
         _collect_ref_issues(source, issues, path="#")
         try:
             validate(source)
-        except Exception as exc:
+        except OpenAPIError as exc:
             issues.append(
                 ContractIssue(
                     code="OPENAPI_INVALID",

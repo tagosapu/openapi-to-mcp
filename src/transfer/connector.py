@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Literal, Protocol
 
 from pydantic import AnyHttpUrl, BaseModel, Field
 
-from .models import MappingDefinition, MappingIssue, OperationSelection, TransferRequest, TransferResult
+from .models import (
+    MappingDefinition,
+    MappingIssue,
+    OperationSelection,
+    TransferRequest,
+    TransferResult,
+)
 from .openapi_contract import ContractPreflightResult
 
 

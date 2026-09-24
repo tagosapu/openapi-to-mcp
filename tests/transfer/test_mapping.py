@@ -1,14 +1,24 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
 import json
+from copy import deepcopy
 
 import pytest
 
-from src.transfer import MappingDefinition, MappingValidationError, OperationSelection, ReviewCorrection, TransferRequest
+from src.transfer import (
+    MappingDefinition,
+    MappingValidationError,
+    OperationSelection,
+    ReviewCorrection,
+    TransferRequest,
+)
 from src.transfer.mapping import MappingEngine
-from tests.transfer.conftest import sample_mapping, sample_mapping_with_target_header, sample_transfer_request
+from tests.transfer.conftest import (
+    sample_mapping,
+    sample_mapping_with_target_header,
+    sample_transfer_request,
+)
 
 
 def _request(payload: dict | None = None) -> TransferRequest:

@@ -1,18 +1,26 @@
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass
-from datetime import date, datetime
 import hashlib
 import json
 import math
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any
 
 from jsonpointer import JsonPointerException, resolve_pointer
 
 from .errors import MappingValidationError
-from .models import MappingDefinition, MappingIssue, MappingPreview, MappingRule, OperationSelection, OutboundRequestParts, ReviewCorrection, TransferRequest
-
+from .models import (
+    MappingDefinition,
+    MappingIssue,
+    MappingPreview,
+    MappingRule,
+    OperationSelection,
+    OutboundRequestParts,
+    ReviewCorrection,
+    TransferRequest,
+)
 
 _MISSING = object()
 _REVIEWABLE_STATUSES = {"missing", "ambiguous", "invalid"}
@@ -212,19 +220,21 @@ class MappingEngine:
         return transformed
 
     def _condition_matches(self, document: dict[str, Any], rule: MappingRule) -> bool:
-        assert rule.condition is not None
-        source_value = _resolve_pointer(document, rule.condition.source)
-        if rule.condition.operator == "exists":
+        condition = rule.condition
+        if condition is None:
+            return False
+        source_value = _resolve_pointer(document, condition.source)
+        if condition.operator == "exists":
             return source_value is not _MISSING
         if source_value is _MISSING:
             return False
-        if rule.condition.operator == "equals":
-            return source_value == rule.condition.value
-        if rule.condition.operator == "not_equals":
-            return source_value != rule.condition.value
-        if not isinstance(rule.condition.value, list | tuple | set):
+        if condition.operator == "equals":
+            return source_value == condition.value
+        if condition.operator == "not_equals":
+            return source_value != condition.value
+        if not isinstance(condition.value, list | tuple | set):
             return False
-        return source_value in rule.condition.value
+        return source_value in condition.value
 
     def _build_issue(self, document: dict[str, Any], rule: MappingRule) -> MappingIssue | None:
         field_pointer = _field_pointer_from_source(rule.source)

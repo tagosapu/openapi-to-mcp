@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from math import ceil
 from collections.abc import Mapping
+from math import ceil
 from typing import Any, Protocol
 
 from pydantic import BaseModel

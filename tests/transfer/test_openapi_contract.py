@@ -7,7 +7,6 @@ import yaml
 
 from src.transfer.openapi_contract import ContractPreflight
 
-
 FIXTURES = Path(__file__).with_name("fixtures")
 
 

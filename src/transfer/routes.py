@@ -28,8 +28,8 @@ from .errors import (
 from .limits import RateLimitDecision
 from .mapping import MappingEngine
 from .models import (
-    ConnectorDefinition,
     ConnectorCreateRequest,
+    ConnectorDefinition,
     MappingDefinition,
     MappingIssue,
     MappingPreview,
@@ -44,8 +44,8 @@ from .models import (
     TransferRequest,
     TransferStatus,
 )
-from .openapi_contract import ContractPreflight, public_spec_hash
 from .observability import SecretRedactor
+from .openapi_contract import ContractPreflight, public_spec_hash
 from .store import TransferStore, encode_transfer_cursor
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -592,8 +592,8 @@ def create_router() -> APIRouter:
             cursor = await connection.execute("SELECT 1")
             await cursor.fetchone()
             await cursor.close()
-            resolver = getattr(request.app.state, "credential_resolver")
-            settings = getattr(request.app.state, "settings")
+            resolver = request.app.state.credential_resolver
+            settings = request.app.state.settings
             key_ref = settings.data_encryption_key_ref
             if key_ref is None:
                 raise RuntimeError("encryption key is not configured")
@@ -602,7 +602,7 @@ def create_router() -> APIRouter:
                 worker_task = getattr(_worker(request), "_task", None)
                 if worker_task is None or worker_task.done():
                     dependencies["worker"] = "failed"
-        except Exception:
+        except Exception:  # noqa: BLE001
             if dependencies["sqlite"] == "ok":
                 dependencies["sqlite"] = "failed"
             if dependencies["credentials"] == "ok":

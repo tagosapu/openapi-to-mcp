@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 import ipaddress
 import json
 import re
 import socket
 import time
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -17,13 +17,33 @@ from jsonpointer import JsonPointerException, resolve_pointer
 from jsonschema import Draft202012Validator
 
 from .auth import CredentialResolver, SecretBundle
-from .connector import ErrorClassification, OutboundOutcome, OutboundRequest, ReconciliationContext, ReconciliationResult, ValidationResult
+from .connector import (
+    ErrorClassification,
+    OutboundOutcome,
+    OutboundRequest,
+    ReconciliationContext,
+    ReconciliationResult,
+    ValidationResult,
+)
 from .errors import MappingValidationError, NotFoundError
 from .mapping import MappingEngine
-from .models import ConnectorDefinition, MappingDefinition, MappingIssue, OperationBinding, OperationSelection, OutboundRequestParts, TransferRequest, TransferResult
-from .openapi_contract import ContractPreflight, ContractPreflightResult, NormalizedOperation, ParameterDefinition
+from .models import (
+    ConnectorDefinition,
+    MappingDefinition,
+    MappingIssue,
+    OperationBinding,
+    OperationSelection,
+    OutboundRequestParts,
+    TransferRequest,
+    TransferResult,
+)
+from .openapi_contract import (
+    ContractPreflight,
+    ContractPreflightResult,
+    NormalizedOperation,
+    ParameterDefinition,
+)
 from .settings import TransferSettings as Settings
-
 
 INTERNAL_ERROR_CODE_HEADER = "x-openapi-to-mcp-error-code"
 PROTECTED_HEADERS = {"authorization", "content-length", "cookie", "host"}
@@ -420,7 +440,7 @@ class RestOpenApiConnector:
                     password = _bundle_secret_value(bundle, preferred=("password", "pass"))
                 except ValueError as exc:
                     raise _SecurityOptionUnavailable from exc
-                token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+                token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
                 headers["Authorization"] = f"Basic {token}"
                 continue
             if scheme_type == "oauth2":
@@ -439,7 +459,7 @@ class RestOpenApiConnector:
     ) -> str:
         token_url = scheme.get("flows", {}).get("clientCredentials", {}).get("tokenUrl")
         if not isinstance(token_url, str):
-            raise ValueError("OAUTH_TOKEN_URL_MISSING")
+            raise TypeError("OAUTH_TOKEN_URL_MISSING")
         token_url_object = httpx.URL(token_url)
         self._validate_target(
             token_url_object,
@@ -513,13 +533,19 @@ class RestOpenApiConnector:
     ) -> None:
         if url.scheme not in {"http", "https"} or url.host is None:
             raise ValueError("TARGET_URL_INVALID")
-        if self._settings is not None and self._settings.allowed_hosts:
-            if url.host not in self._settings.allowed_hosts:
-                raise ValueError("HOST_NOT_ALLOWED")
+        if (
+            self._settings is not None
+            and self._settings.allowed_hosts
+            and url.host not in self._settings.allowed_hosts
+        ):
+            raise ValueError("HOST_NOT_ALLOWED")
         current_addresses = resolve_host_addresses(url.host)
         if any(_is_blocked_ip(address) for address in current_addresses):
             raise ValueError("SSRF_ADDRESS_BLOCKED")
-        if registration_addresses is not None and set(current_addresses) != set(registration_addresses):
+        if (
+            registration_addresses is not None
+            and set(current_addresses) != set(registration_addresses)
+        ):
             raise ValueError("SSRF_DNS_REBINDING_DETECTED")
 
     def _build_outcome(self, response: httpx.Response, *, body_bytes: bytes, elapsed_ms: int = 0) -> OutboundOutcome:
@@ -683,7 +709,7 @@ async def _resolve_for_tenant(
 ) -> SecretBundle:
     resolver_method = getattr(resolver, "resolve_for_tenant", None)
     if not callable(resolver_method):
-        raise RuntimeError("tenant-aware credential resolver is required")
+        raise TypeError("tenant-aware credential resolver is required")
     return await resolver_method(tenant_id, str(credential_ref))
 
 
@@ -896,7 +922,7 @@ def _coerce_lookup_parameter_value(value: Any, parameter: ParameterDefinition) -
 
 def _coerce_integer(value: Any) -> int:
     if isinstance(value, bool):
-        raise ValueError("LOOKUP_PARAMETER_INVALID")
+        raise ValueError("LOOKUP_PARAMETER_INVALID")  # noqa: TRY004
     if isinstance(value, int):
         return value
     if isinstance(value, float) and value.is_integer():
@@ -908,7 +934,7 @@ def _coerce_integer(value: Any) -> int:
 
 def _coerce_number(value: Any) -> int | float:
     if isinstance(value, bool):
-        raise ValueError("LOOKUP_PARAMETER_INVALID")
+        raise ValueError("LOOKUP_PARAMETER_INVALID")  # noqa: TRY004
     if isinstance(value, (int, float)):
         return value
     if isinstance(value, str):

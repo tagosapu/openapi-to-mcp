@@ -27,17 +27,17 @@ class EnvironmentCredentialResolver:
         raw_json = settings.credentials_json.get_secret_value() if settings.credentials_json is not None else "{}"
         decoded = json.loads(raw_json)
         if not isinstance(decoded, dict):
-            raise RuntimeError("TRANSFER_CREDENTIALS_JSON must decode to an object")
+            raise TypeError("TRANSFER_CREDENTIALS_JSON must decode to an object")
         self._credentials = decoded
         self._tenant_credentials: dict[str, dict[str, Any]] = {}
         self._global_credentials: dict[str, Any] = {}
         scoped_credentials = decoded.get("tenants")
         if scoped_credentials is not None:
             if not isinstance(scoped_credentials, dict):
-                raise RuntimeError("TRANSFER_CREDENTIALS_JSON tenants must be an object")
+                raise TypeError("TRANSFER_CREDENTIALS_JSON tenants must be an object")
             for tenant_id, values in scoped_credentials.items():
                 if not isinstance(values, dict):
-                    raise RuntimeError("TRANSFER_CREDENTIALS_JSON tenant entries must be objects")
+                    raise TypeError("TRANSFER_CREDENTIALS_JSON tenant entries must be objects")
                 self._tenant_credentials[str(tenant_id)] = values
             global_credentials = decoded.get("global", {})
             if not isinstance(global_credentials, dict):
@@ -62,7 +62,7 @@ def _secret_bundle(credential_ref: str, value: Any) -> SecretBundle:
     if isinstance(value, str):
         return SecretBundle(values={"value": SecretStr(value)})
     if not isinstance(value, dict):
-        raise RuntimeError(f"credential ref has invalid payload: {credential_ref}")
+        raise TypeError(f"credential ref has invalid payload: {credential_ref}")
     return SecretBundle(values={key: SecretStr(str(raw)) for key, raw in value.items()})
 
 

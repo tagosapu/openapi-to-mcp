@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
-from cryptography.fernet import Fernet
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 
 from src.transfer.mapping import MappingEngine
-from src.transfer.models import ConnectorDefinition, MappingDefinition, OutboundRequestParts, TransferRequest
-from tests.transfer.conftest import sample_connector_definition, sample_mapping, sample_transfer_request, settings_factory
-
+from src.transfer.models import (
+    ConnectorDefinition,
+    MappingDefinition,
+    OutboundRequestParts,
+    TransferRequest,
+)
+from tests.transfer.conftest import (
+    sample_connector_definition,
+    sample_mapping,
+    sample_transfer_request,
+    settings_factory,
+)
 
 BASE_URL = "https://93.184.216.34"
 TOKEN_URL = "https://93.184.216.35/oauth/token"

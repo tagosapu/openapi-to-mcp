@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import logging
 import random
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any, Literal
 
 from jsonpointer import JsonPointerException, resolve_pointer
 from pydantic import BaseModel, Field
 
-from .connector import Connector, ErrorClassification, OutboundOutcome, ReconciliationContext
+from .connector import (
+    Connector,
+    ErrorClassification,
+    OutboundOutcome,
+    ReconciliationContext,
+)
 from .errors import InvalidTransitionError, MappingValidationError, NotFoundError
 from .mapping import MappingEngine
 from .models import (
@@ -31,7 +36,6 @@ from .models import (
 from .observability import TransferObservability
 from .settings import TransferSettings as Settings
 from .store import TransferStore
-
 
 _WORKER_POLL_SECONDS = 1.0
 _MAINTENANCE_INTERVAL = timedelta(minutes=5)
@@ -59,7 +63,7 @@ class RetryPolicy(BaseModel):
     retry_statuses: set[int] = Field(default_factory=lambda: set(_RETRYABLE_STATUS_CODES))
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "RetryPolicy":
+    def from_settings(cls, settings: Settings) -> RetryPolicy:
         return cls()
 
 
@@ -207,7 +211,6 @@ class TransferWorker:
                 TransferStatus.WAITING_REVIEW,
                 TransferStatus.FAILED,
                 {
-                    "actor": _REVIEW_ACTOR,
                     "actor": actor,
                     "decision": decision,
                     "reason": reason,
@@ -372,7 +375,7 @@ class TransferWorker:
         while not self._stop_event.is_set():
             try:
                 await self.run_maintenance()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning(
                     "transfer maintenance failed",
                     extra={"error_type": type(exc).__name__},
@@ -381,7 +384,7 @@ class TransferWorker:
                 continue
             try:
                 worked = await self.run_once()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning(
                     "transfer worker iteration failed",
                     extra={"error_type": type(exc).__name__},
@@ -476,7 +479,7 @@ class TransferWorker:
             classification = loaded.connector.classify_error(outcome)
             duration_ms = outcome.elapsed_ms
             request_id = outcome.request_id
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             if not send_started:
                 await self._finalize_pre_send_failure(record, exc)
                 return
@@ -626,7 +629,7 @@ class TransferWorker:
                 target_resource_id = _optional_target_resource_id(parsed)
             else:
                 target_resource_id = _validated_target_resource_id(parsed)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             await self._store.transition_state(
                 record.tenant_id,
                 record.transfer_id,
@@ -670,7 +673,7 @@ class TransferWorker:
                     target_resource_id=target_resource_id,
                 )
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             parsed.completed_at = _utc_now()
             await self._store.transition_state(
                 record.tenant_id,
@@ -917,7 +920,7 @@ class TransferWorker:
         jitter = self._retry_policy.jitter_ratio
         if jitter <= 0:
             return base
-        factor = 1 + random.uniform(-jitter, jitter)
+        factor = 1 + random.SystemRandom().uniform(-jitter, jitter)
         return min(self._retry_policy.max_delay_seconds, max(0.0, base * factor))
 
     def _should_retry(

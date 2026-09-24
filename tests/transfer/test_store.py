@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -54,7 +54,11 @@ async def encrypted_store(tmp_path):
 @pytest.mark.asyncio
 async def test_store_keeps_connector_mapping_review_and_events_tenant_scoped(store) -> None:
     from src.transfer.errors import TenantIsolationError
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferStatus
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferStatus,
+    )
 
     await store.save_connector(
         ConnectorDefinition.model_validate(sample_connector_definition()),
@@ -110,7 +114,11 @@ async def test_save_mapping_keeps_same_version_immutable(store) -> None:
 @pytest.mark.asyncio
 async def test_create_or_get_transfer_is_tenant_scoped_and_detects_hash_conflict(store) -> None:
     from src.transfer.errors import IdempotencyConflict
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+    )
 
     await store.save_connector(
         ConnectorDefinition.model_validate(sample_connector_definition()),
@@ -187,7 +195,11 @@ async def test_create_or_get_transfer_is_tenant_scoped_and_detects_hash_conflict
 @pytest.mark.asyncio
 async def test_create_or_get_transfer_rejects_deduplication_path_mismatch_before_persist(store) -> None:
     from src.transfer.errors import MappingValidationError
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+    )
 
     await store.save_connector(
         ConnectorDefinition.model_validate(sample_connector_definition()),
@@ -227,7 +239,11 @@ async def test_create_or_get_transfer_honors_retention_and_allows_reuse_after_ex
 ) -> None:
     from src.transfer import store as store_module
     from src.transfer.errors import IdempotencyConflict
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+    )
     from src.transfer.store import SqliteTransferStore
 
     now = datetime(2026, 9, 18, 0, 0, tzinfo=UTC)
@@ -474,7 +490,12 @@ async def test_transition_rejects_stale_update_without_appending_phantom_event(
     store, monkeypatch
 ) -> None:
     from src.transfer.errors import InvalidTransitionError
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+        TransferStatus,
+    )
 
     await store.save_connector(
         ConnectorDefinition.model_validate(sample_connector_definition()),
@@ -542,7 +563,12 @@ async def test_transition_rejects_stale_update_without_appending_phantom_event(
 async def test_transition_state_clears_stale_result_error_and_completed_at_when_reactivating(
     store, initial_status: str, target_status: str
 ) -> None:
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+        TransferStatus,
+    )
 
     await store.save_connector(
         ConnectorDefinition.model_validate(sample_connector_definition()),
@@ -670,7 +696,12 @@ async def test_transition_state_clears_stale_result_error_and_completed_at_when_
 async def test_recover_inflight_skips_stale_rows_without_appending_phantom_event(
     store, monkeypatch
 ) -> None:
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+        TransferStatus,
+    )
 
     await store.save_connector(
         ConnectorDefinition.model_validate(sample_connector_definition()),
@@ -746,7 +777,12 @@ async def test_recover_inflight_skips_stale_rows_without_appending_phantom_event
 
 @pytest.mark.asyncio
 async def test_transition_allows_partial_success_as_terminal_delivery_result(store) -> None:
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+        TransferStatus,
+    )
 
     await store.save_connector(
         ConnectorDefinition.model_validate(sample_connector_definition()),
@@ -811,7 +847,12 @@ async def test_transition_allows_partial_success_as_terminal_delivery_result(sto
 @pytest.mark.asyncio
 async def test_audit_chain_uses_stable_order_for_same_timestamp_events(store, monkeypatch) -> None:
     from src.transfer import store as store_module
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+        TransferStatus,
+    )
 
     fixed_now = datetime(2026, 9, 18, 1, 0, tzinfo=UTC)
     monkeypatch.setattr(store_module, "_utc_now", lambda: fixed_now)
@@ -869,7 +910,12 @@ async def test_audit_chain_uses_stable_order_for_same_timestamp_events(store, mo
 @pytest.mark.asyncio
 async def test_audit_chain_uses_event_order_when_timestamps_skew(store, monkeypatch) -> None:
     from src.transfer import store as store_module
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest, TransferStatus
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+        TransferStatus,
+    )
 
     await store.save_connector(
         ConnectorDefinition.model_validate(sample_connector_definition()),
@@ -916,7 +962,11 @@ async def test_audit_chain_uses_event_order_when_timestamps_skew(store, monkeypa
 @pytest.mark.asyncio
 async def test_review_corrections_are_encrypted_and_events_are_redacted(encrypted_store) -> None:
     store, db_path = encrypted_store
-    from src.transfer.models import ConnectorDefinition, MappingDefinition, TransferRequest
+    from src.transfer.models import (
+        ConnectorDefinition,
+        MappingDefinition,
+        TransferRequest,
+    )
 
     await store.save_connector(
         ConnectorDefinition.model_validate(sample_connector_definition()),

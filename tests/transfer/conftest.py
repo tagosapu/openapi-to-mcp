@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
 import json
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

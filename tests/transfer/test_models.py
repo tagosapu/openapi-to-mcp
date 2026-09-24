@@ -3,8 +3,18 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from src.transfer.models import ConnectorDefinition, MappingDefinition, OcrField, OcrSource, TransferRequest
-from tests.transfer.conftest import sample_connector_definition, sample_mapping, sample_transfer_request
+from src.transfer.models import (
+    ConnectorDefinition,
+    MappingDefinition,
+    OcrField,
+    OcrSource,
+    TransferRequest,
+)
+from tests.transfer.conftest import (
+    sample_connector_definition,
+    sample_mapping,
+    sample_transfer_request,
+)
 
 
 def test_confidence_and_field_status_are_bounded() -> None:

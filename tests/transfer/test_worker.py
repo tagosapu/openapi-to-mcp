@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -32,8 +32,12 @@ from src.transfer.models import (
 )
 from src.transfer.store import SqliteTransferStore
 from src.transfer.worker import RetryPolicy, TransferWorker
-from tests.transfer.conftest import sample_connector_definition, sample_mapping, sample_transfer_request, settings_factory
-
+from tests.transfer.conftest import (
+    sample_connector_definition,
+    sample_mapping,
+    sample_transfer_request,
+    settings_factory,
+)
 
 FIXED_NOW = datetime(2026, 9, 18, tzinfo=UTC)
 
@@ -939,9 +943,13 @@ async def test_worker_start_persists_job_failure_and_continues_to_next_job(store
             while True:
                 first = await store.get_transfer("tenant-a", first_transfer_id)
                 second = await store.get_transfer("tenant-a", second_transfer_id)
-                if first is not None and second is not None:
-                    if first.status == TransferStatus.FAILED and second.status == TransferStatus.SUCCEEDED:
-                        return first, second
+                if (
+                    first is not None
+                    and second is not None
+                    and first.status == TransferStatus.FAILED
+                    and second.status == TransferStatus.SUCCEEDED
+                ):
+                    return first, second
                 await asyncio.sleep(0)
 
         first_record, second_record = await asyncio.wait_for(wait_for_processing(), timeout=1)

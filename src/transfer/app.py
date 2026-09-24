@@ -34,7 +34,6 @@ from .settings import TransferSettings as Settings
 from .store import SqliteTransferStore, create_payload_protector
 from .worker import RetryPolicy, TransferWorker
 
-
 _PUBLIC_OPERATION_IDS = {
     ("/v1/transfers", "post"): ("createTransfer", ["transfer:write"]),
     ("/v1/transfers", "get"): ("listTransfers", ["transfer:read"]),
