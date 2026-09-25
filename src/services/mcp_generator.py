@@ -3,14 +3,18 @@ MCP Server Code Generator
 Generates FastMCP server code from OpenAPI specifications using LLM prompts.
 """
 
-import re
 import ast
+import hashlib
+import json
 import logging
+import re
+from enum import Enum
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from datetime import datetime
 from .llm_client import get_llm_client, LLMRequest
 from .openapi_mcp_codegen import count_operations, write_generated_artifacts
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
 
 
 # Configure logging with basicConfig
@@ -31,6 +35,260 @@ class MCPGenerationError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.validation = dict(validation or {})
+
+
+class GeneratedArtifactVerificationStatus(str, Enum):
+    """Verification outcome for generated MCP artifacts."""
+
+    PASSED = "passed"
+    FAILED = "failed"
+    UNVALIDATED = "unvalidated"
+    SKIPPED = "skipped"
+
+
+class GeneratedArtifactRepairer(Protocol):
+    """Protocol for bounded artifact repair attempts."""
+
+    async def repair(
+        self,
+        artifact_dir: Path,
+        openapi_spec: Mapping[str, Any],
+        report: Mapping[str, Any],
+        attempt: int,
+    ) -> Mapping[str, Any]:
+        ...
+
+
+def _get_generator_version() -> str:
+    try:
+        return package_version("openapi-to-mcp")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+def _hash_openapi_spec(openapi_spec: Mapping[str, Any]) -> str:
+    normalized = json.dumps(
+        openapi_spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _build_generated_artifact_report(
+    *,
+    artifact_dir: Path,
+    openapi_spec: Mapping[str, Any],
+    seed: int,
+    timeout_seconds: float,
+    status: GeneratedArtifactVerificationStatus,
+) -> Dict[str, Any]:
+    return {
+        "artifact_dir": str(artifact_dir),
+        "spec_sha256": _hash_openapi_spec(openapi_spec),
+        "generator_version": _get_generator_version(),
+        "seed": int(seed),
+        "timeout_seconds": float(timeout_seconds),
+        "status": status.value,
+        "file_checks": [],
+        "operation_statuses": [],
+        "repair_attempts": [],
+        "changed_files": [],
+        "failure_codes": [],
+        "failures": [],
+    }
+
+
+def _tool_names_from_server_source(server_source: str) -> set[str]:
+    return {name for name, _, _ in _parse_mcp_tools_from_code(server_source)}
+
+
+def _append_failure(report: Dict[str, Any], code: str, message: str) -> None:
+    report["failure_codes"].append(code)
+    report["failures"].append({"code": code, "message": message})
+
+
+def _normalize_repair_attempt(
+    attempt_result: Mapping[str, Any] | None, attempt: int, artifact_dir: Path
+) -> Dict[str, Any]:
+    attempt_payload = dict(attempt_result or {})
+    candidate_dir = attempt_payload.get("candidate_dir") or str(artifact_dir)
+    changed_files = attempt_payload.get("changed_files") or []
+    failure_codes = attempt_payload.get("failure_codes") or []
+    accepted = bool(attempt_payload.get("accepted", False))
+    return {
+        "attempt": attempt,
+        "candidate_dir": str(candidate_dir),
+        "changed_files": [str(path) for path in changed_files],
+        "accepted": accepted,
+        "failure_codes": [str(code) for code in failure_codes],
+    }
+
+
+async def verify_generated_artifacts(
+    openapi_spec: Mapping[str, Any],
+    artifact_dir: Path,
+    *,
+    seed: int = 0,
+    timeout_seconds: float = 30.0,
+) -> Dict[str, Any]:
+    """Perform deterministic local verification of generated MCP artifacts."""
+
+    artifact_dir = Path(artifact_dir)
+    report = _build_generated_artifact_report(
+        artifact_dir=artifact_dir,
+        openapi_spec=openapi_spec,
+        seed=seed,
+        timeout_seconds=timeout_seconds,
+        status=GeneratedArtifactVerificationStatus.UNVALIDATED,
+    )
+
+    if not artifact_dir.exists():
+        report["status"] = GeneratedArtifactVerificationStatus.FAILED.value
+        _append_failure(
+            report,
+            "missing_artifact_directory",
+            f"generated artifact directory does not exist: {artifact_dir}",
+        )
+        return report
+
+    expected_files = [
+        "server.py",
+        "runtime.py",
+        "client.py",
+        "requirements.txt",
+        "README.md",
+        "tool_spec.txt",
+    ]
+    for file_name in expected_files:
+        file_path = artifact_dir / file_name
+        file_status = "passed" if file_path.exists() else "failed"
+        if file_status == "failed":
+            _append_failure(
+                report,
+                f"missing_{file_name.replace('.', '_')}",
+                f"missing generated file: {file_name}",
+            )
+        report["file_checks"].append(
+            {
+                "file_name": file_name,
+                "status": file_status,
+            }
+        )
+
+    try:
+        server_source = (artifact_dir / "server.py").read_text(encoding="utf-8")
+        tool_names = _tool_names_from_server_source(server_source)
+    except Exception:
+        report["status"] = GeneratedArtifactVerificationStatus.FAILED.value
+        _append_failure(
+            report,
+            "server_parse_error",
+            "unable to parse generated server.py",
+        )
+        return report
+
+    operations = collect_operations(openapi_spec)
+    for operation in operations:
+        if operation.tool_name in tool_names:
+            report["operation_statuses"].append(
+                {
+                    "operation_id": operation.operation_id,
+                    "tool_name": operation.tool_name,
+                    "status": GeneratedArtifactVerificationStatus.PASSED.value,
+                }
+            )
+            continue
+
+        report["operation_statuses"].append(
+            {
+                "operation_id": operation.operation_id,
+                "tool_name": operation.tool_name,
+                "status": GeneratedArtifactVerificationStatus.FAILED.value,
+                "failure_code": "missing_generated_tool",
+            }
+        )
+        _append_failure(
+            report,
+            "missing_generated_tool",
+            f"missing generated tool for operation {operation.operation_id}",
+        )
+
+    if report["failure_codes"]:
+        report["status"] = GeneratedArtifactVerificationStatus.FAILED.value
+    else:
+        report["status"] = GeneratedArtifactVerificationStatus.PASSED.value
+
+    return report
+
+
+async def verify_with_repair(
+    openapi_spec: Mapping[str, Any],
+    artifact_dir: Path,
+    *,
+    repairer: GeneratedArtifactRepairer | None,
+    seed: int = 0,
+    timeout_seconds: float = 30.0,
+    max_repair_attempts: int = 2,
+) -> Dict[str, Any]:
+    """Verify generated artifacts and attempt bounded repairs when needed."""
+
+    max_repair_attempts = max(0, min(int(max_repair_attempts), 2))
+    current_dir = Path(artifact_dir)
+    report = await verify_generated_artifacts(
+        openapi_spec,
+        current_dir,
+        seed=seed,
+        timeout_seconds=timeout_seconds,
+    )
+
+    if report["status"] == GeneratedArtifactVerificationStatus.PASSED.value:
+        return report
+
+    if max_repair_attempts == 0:
+        return report
+
+    if repairer is None:
+        report["repair_attempts"].append(
+            {
+                "attempt": 1,
+                "candidate_dir": str(current_dir),
+                "changed_files": [],
+                "accepted": False,
+                "failure_codes": ["repairer_not_configured"],
+            }
+        )
+        return report
+
+    repair_attempts: list[Dict[str, Any]] = []
+    changed_files: list[str] = list(report.get("changed_files", []))
+    for attempt in range(1, max_repair_attempts + 1):
+        attempt_result = await repairer.repair(current_dir, openapi_spec, report, attempt)
+        normalized_attempt = _normalize_repair_attempt(
+            attempt_result, attempt, current_dir
+        )
+        repair_attempts.append(normalized_attempt)
+
+        candidate_dir = Path(normalized_attempt["candidate_dir"])
+        if normalized_attempt["accepted"] and candidate_dir.exists():
+            current_dir = candidate_dir
+        for changed_file in normalized_attempt["changed_files"]:
+            if changed_file not in changed_files:
+                changed_files.append(changed_file)
+
+        report = await verify_generated_artifacts(
+            openapi_spec,
+            current_dir,
+            seed=seed,
+            timeout_seconds=timeout_seconds,
+        )
+        report["repair_attempts"] = list(repair_attempts)
+        report["changed_files"] = list(changed_files)
+        if report["status"] == GeneratedArtifactVerificationStatus.PASSED.value:
+            return report
+
+    report["repair_attempts"] = list(repair_attempts)
+    report["changed_files"] = list(changed_files)
+    report["status"] = GeneratedArtifactVerificationStatus.FAILED.value
+    return report
 
 
 def _count_openapi_operations(openapi_spec: Mapping[str, Any]) -> int:

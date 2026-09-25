@@ -12,6 +12,12 @@ from .evaluation import (
     SchemaEvaluation,
     SecurityRequirement,
 )
+from .generated_validation import (
+    GeneratedArtifactVerificationResult,
+    OperationVerificationResult,
+    RepairAttemptResult,
+    VerificationStatus,
+)
 
 __all__ = [
     "OpenAPIEvaluationResult",
@@ -22,4 +28,8 @@ __all__ = [
     "ResponseEvaluation",
     "SchemaEvaluation",
     "SecurityRequirement",
+    "GeneratedArtifactVerificationResult",
+    "OperationVerificationResult",
+    "RepairAttemptResult",
+    "VerificationStatus",
 ]

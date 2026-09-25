@@ -1,6 +1,6 @@
 import pytest
 
-from src.services.mcp_generator import MCPServerGenerator
+from src.services.mcp_generator import MCPServerGenerator, verify_generated_artifacts
 
 
 def test_validate_generated_server_rejects_fallback_code():
@@ -44,3 +44,16 @@ async def test_generate_server_code_uses_deterministic_artifacts(tmp_path):
     assert usage["operation_count"] == 1
     assert usage["tool_count"] == 1
     assert usage["server_usage"]["source"] == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_verify_generated_artifacts_reports_missing_directory(tmp_path):
+    report = await verify_generated_artifacts(
+        {"paths": {"/records": {"get": {"operationId": "getRecords"}}}},
+        tmp_path / "missing",
+        seed=4,
+        timeout_seconds=30,
+    )
+
+    assert report["status"] == "failed"
+    assert report["failure_codes"] == ["missing_artifact_directory"]

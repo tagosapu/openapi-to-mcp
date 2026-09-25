@@ -8,6 +8,9 @@ import asyncio
 import datetime
 import json
 import logging
+import os
+import re
+from collections.abc import Mapping as MappingABC
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,11 +18,12 @@ import yaml
 from pydantic import ValidationError
 from .models.evaluation import OpenAPIEvaluationResult
 from .services.config_loader import config
-from .services.mcp_generator import (
-    MCPGenerationError,
-    MCPServerGenerator,
-    _count_openapi_operations,
+from .services.generated_artifact_repair import LLMGeneratedArtifactRepairer
+from .services.generated_artifact_verifier import (
+    verify_generated_artifacts,
+    verify_with_repair,
 )
+from .services.mcp_generator import MCPGenerationError, MCPServerGenerator, _count_openapi_operations
 from .services.openapi_enhancer import (
     EnhancementRequest,
     EnhancementResult,
@@ -48,6 +52,11 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+_SECRET_ENV_NAME_PATTERN = re.compile(
+    r"(token|secret|password|api[_-]?key|auth)", re.IGNORECASE
+)
 
 
 # Thresholds loaded from config.yml
@@ -120,6 +129,28 @@ VISION_MODEL, matching the official Azure OpenAI SDK convention.
         action="store_true",
         help="Only run evaluation, skip MCP server/client generation",
     )
+    parser.add_argument(
+        "--verify-generated",
+        action="store_true",
+        default=None,
+        help="Run generated artifact verification after MCP generation",
+    )
+    parser.add_argument(
+        "--repair-generated",
+        action="store_true",
+        default=None,
+        help="Enable bounded repair attempts for generated artifacts (implies verification)",
+    )
+    parser.add_argument(
+        "--generated-verification-seed",
+        type=int,
+        help="Seed for deterministic generated artifact verification",
+    )
+    parser.add_argument(
+        "--generated-repair-attempts",
+        type=int,
+        help="Maximum generated artifact repair attempts (clamped to 0..2)",
+    )
 
     return parser
 
@@ -190,6 +221,344 @@ def _prepare_execution_context(
     output_config = _determine_output_config(args, model, filename)
 
     return filename, spec_source, model, output_config
+
+
+def _create_generated_artifact_repairer() -> LLMGeneratedArtifactRepairer:
+    return LLMGeneratedArtifactRepairer()
+
+
+def _resolve_generated_artifact_verification_settings(
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    verify_flag = getattr(args, "verify_generated", None)
+    repair_flag = getattr(args, "repair_generated", None)
+    seed_arg = getattr(args, "generated_verification_seed", None)
+    attempts_arg = getattr(args, "generated_repair_attempts", None)
+
+    verify_enabled = (
+        bool(verify_flag)
+        if verify_flag is not None
+        else config.get_bool("generated_verification_enabled", False)
+    )
+    repair_enabled = (
+        bool(repair_flag)
+        if repair_flag is not None
+        else config.get_bool("generated_repair_enabled", False)
+    )
+    if repair_enabled:
+        verify_enabled = True
+
+    seed = (
+        int(seed_arg)
+        if seed_arg is not None
+        else config.get_int("generated_verification_seed", 0)
+    )
+    timeout_seconds = config.get_int("generated_verification_timeout_seconds", 30)
+    repair_attempts = (
+        int(attempts_arg)
+        if attempts_arg is not None
+        else config.get_int("generated_repair_max_attempts", 2)
+    )
+    repair_attempts = max(0, min(repair_attempts, 2))
+
+    return {
+        "verify_enabled": verify_enabled,
+        "repair_enabled": repair_enabled,
+        "seed": seed,
+        "timeout_seconds": timeout_seconds,
+        "repair_attempts": repair_attempts,
+    }
+
+
+def _coerce_generated_artifact_verification_report(
+    report: Any,
+) -> Dict[str, Any]:
+    if callable(getattr(report, "model_dump", None)):
+        payload = report.model_dump(mode="json")
+    elif isinstance(report, dict):
+        payload = dict(report)
+    elif isinstance(report, MappingABC):
+        payload = dict(report)
+    else:
+        payload = dict(vars(report))
+    if not isinstance(payload, MappingABC):
+        payload = dict(payload)
+    return _sanitize_generated_artifact_verification_report(payload)
+
+
+def _sanitize_generated_artifact_verification_report(
+    report: MappingABC[str, Any],
+) -> Dict[str, Any]:
+    secret_values = _secret_values()
+    operations = _collect_operation_summaries(report, secret_values)
+    repair_attempts = _collect_repair_attempts(report, secret_values)
+    failure_codes = _collect_failure_codes(report)
+    changed_files = _collect_changed_files(report, repair_attempts)
+
+    sanitized: Dict[str, Any] = {
+        "artifact_dir": _sanitize_string(report.get("artifact_dir", ""), secret_values),
+        "spec_sha256": _sanitize_string(report.get("spec_sha256", ""), secret_values),
+        "generator_version": _sanitize_string(
+            report.get("generator_version", ""), secret_values
+        ),
+        "seed": report.get("seed", 0),
+        "status": report.get("status", "unvalidated"),
+        "operations": operations,
+        "repair_attempts": repair_attempts,
+        "failure_codes": failure_codes,
+        "failures": list(failure_codes),
+    }
+
+    if "attempts" in report:
+        sanitized["attempts"] = report.get("attempts", 0)
+    if "timeout_seconds" in report:
+        sanitized["timeout_seconds"] = report.get("timeout_seconds", 0)
+    if changed_files:
+        sanitized["changed_files"] = changed_files
+    if "file_checks" in report:
+        sanitized["file_checks"] = _collect_file_checks(report, secret_values)
+
+    return sanitized
+
+
+def _collect_operation_summaries(
+    report: MappingABC[str, Any], secret_values: list[str]
+) -> list[Dict[str, Any]]:
+    raw_operations = report.get("operations") or report.get("operation_statuses") or []
+    operations: list[Dict[str, Any]] = []
+    for item in raw_operations:
+        if not isinstance(item, MappingABC):
+            continue
+        summary: Dict[str, Any] = {
+            "operation_id": _sanitize_string(item.get("operation_id", ""), secret_values),
+            "tool_name": _sanitize_string(item.get("tool_name", ""), secret_values),
+            "status": _sanitize_string(item.get("status", "unvalidated"), secret_values),
+        }
+        if item.get("failure_code") is not None:
+            summary["failure_code"] = _sanitize_string(item.get("failure_code"), secret_values)
+        if item.get("request_valid") is not None:
+            summary["request_valid"] = bool(item.get("request_valid"))
+        if item.get("response_valid") is not None:
+            summary["response_valid"] = bool(item.get("response_valid"))
+        if item.get("error_kind") is not None:
+            summary["error_kind"] = _sanitize_string(item.get("error_kind"), secret_values)
+        if item.get("scenario_kind") is not None:
+            summary["scenario_kind"] = _sanitize_string(item.get("scenario_kind"), secret_values)
+        operations.append(summary)
+    return operations
+
+
+def _collect_repair_attempts(
+    report: MappingABC[str, Any], secret_values: list[str]
+) -> list[Dict[str, Any]]:
+    raw_attempts = report.get("repair_attempts") or []
+    attempts: list[Dict[str, Any]] = []
+    for item in raw_attempts:
+        if not isinstance(item, MappingABC):
+            continue
+        attempt: Dict[str, Any] = {
+            "attempt": item.get("attempt", 0),
+            "accepted": bool(item.get("accepted", False)),
+        }
+        changed_files = item.get("changed_files") or []
+        if changed_files:
+            attempt["changed_files"] = [
+                _sanitize_string(str(file_name), secret_values) for file_name in changed_files
+            ]
+        failure_codes = _extract_failure_codes(item.get("failure_codes") or [])
+        if failure_codes:
+            attempt["failure_codes"] = failure_codes
+        attempts.append(attempt)
+    return attempts
+
+
+def _collect_file_checks(
+    report: MappingABC[str, Any], secret_values: list[str]
+) -> list[Dict[str, Any]]:
+    raw_checks = report.get("file_checks") or []
+    checks: list[Dict[str, Any]] = []
+    for item in raw_checks:
+        if not isinstance(item, MappingABC):
+            continue
+        checks.append(
+            {
+                "file_name": _sanitize_string(item.get("file_name", ""), secret_values),
+                "status": _sanitize_string(item.get("status", ""), secret_values),
+            }
+        )
+    return checks
+
+
+def _collect_failure_codes(report: MappingABC[str, Any]) -> list[str]:
+    failure_codes: list[str] = []
+    failure_codes.extend(_extract_failure_codes(report.get("failure_codes") or []))
+    failure_codes.extend(_extract_failure_codes(report.get("failures") or []))
+    return list(dict.fromkeys(failure_codes))
+
+
+def _collect_changed_files(
+    report: MappingABC[str, Any], repair_attempts: list[Dict[str, Any]]
+) -> list[str]:
+    changed_files: list[str] = []
+    if "changed_files" in report and isinstance(report.get("changed_files"), list):
+        changed_files.extend(str(item) for item in report.get("changed_files", []))
+    for attempt in repair_attempts:
+        changed_files.extend(str(item) for item in attempt.get("changed_files", []))
+    return list(dict.fromkeys(changed_files))
+
+
+def _extract_failure_codes(failures: Any) -> list[str]:
+    if not isinstance(failures, list):
+        return []
+
+    codes: list[str] = []
+    for failure in failures:
+        code = _extract_failure_code(failure)
+        if code:
+            codes.append(code)
+    return codes
+
+
+def _extract_failure_code(failure: Any) -> str | None:
+    if isinstance(failure, str):
+        return failure
+    if isinstance(failure, MappingABC):
+        code = failure.get("code") or failure.get("failure_code")
+        if code is None:
+            return None
+        return str(code)
+    if failure is None:
+        return None
+    return None
+
+
+def _sanitize_string(value: Any, secret_values: list[str]) -> Any:
+    if not isinstance(value, str):
+        return value
+    sanitized = value
+    for secret in secret_values:
+        if secret:
+            sanitized = sanitized.replace(secret, "[REDACTED]")
+    return sanitized
+
+
+def _secret_values() -> list[str]:
+    return [
+        value
+        for name, value in sorted(os.environ.items())
+        if value and _SECRET_ENV_NAME_PATTERN.search(name)
+    ]
+
+
+def _build_generated_artifact_verification_metadata(
+    report: Any,
+    json_report_path: Path,
+    markdown_report_path: Path,
+) -> Dict[str, Any]:
+    report = _coerce_generated_artifact_verification_report(report)
+    operations = list(report.get("operations", []))
+    repair_attempts = list(report.get("repair_attempts", []))
+    return {
+        "status": report.get("status", "unvalidated"),
+        "spec_sha256": report.get("spec_sha256", ""),
+        "seed": report.get("seed", 0),
+        "generator_version": report.get("generator_version", ""),
+        "operation_count": len(operations),
+        "failed_operation_count": sum(
+            1 for item in operations if item.get("status") != "passed"
+        ),
+        "failure_codes": list(report.get("failure_codes", [])),
+        "repair_attempt_count": len(repair_attempts),
+        "repair_attempts": repair_attempts,
+        "report_paths": {
+            "json": str(json_report_path),
+            "markdown": str(markdown_report_path),
+        },
+    }
+
+
+def _render_generated_artifact_verification_summary(report: Any) -> str:
+    report = _coerce_generated_artifact_verification_report(report)
+    lines = ["# Generated Artifact Verification Report", ""]
+    lines.append("## Overview")
+    lines.append("")
+    lines.append("| Field | Value |")
+    lines.append("|-------|-------|")
+    lines.append(f"| **Artifact Dir** | {report.get('artifact_dir', '')} |")
+    lines.append(f"| **Spec SHA-256** | {report.get('spec_sha256', '')} |")
+    lines.append(f"| **Seed** | {report.get('seed', 0)} |")
+    lines.append(f"| **Generator Version** | {report.get('generator_version', '')} |")
+    lines.append(f"| **Status** | {report.get('status', 'unvalidated')} |")
+    lines.append("")
+
+    operations = list(report.get("operations", []))
+    if operations:
+        lines.append("## Operation Statuses")
+        lines.append("")
+        lines.append("| Operation | Tool | Status | Failure Code |")
+        lines.append("|-----------|------|--------|--------------|")
+        for item in operations:
+            lines.append(
+                "| {operation_id} | {tool_name} | {status} | {failure_code} |".format(
+                    operation_id=item.get("operation_id", ""),
+                    tool_name=item.get("tool_name", ""),
+                    status=item.get("status", ""),
+                    failure_code=item.get("failure_code", ""),
+                )
+            )
+        lines.append("")
+
+    repair_attempts = list(report.get("repair_attempts", []))
+    if repair_attempts:
+        lines.append("## Repair Attempts")
+        lines.append("")
+        lines.append("| Attempt | Accepted | Changed Files | Failure Codes |")
+        lines.append("|---------|----------|---------------|---------------|")
+        for item in repair_attempts:
+            lines.append(
+                "| {attempt} | {accepted} | {changed_files} | {failure_codes} |".format(
+                    attempt=item.get("attempt", ""),
+                    accepted=str(item.get("accepted", False)).lower(),
+                    changed_files=", ".join(item.get("changed_files", [])),
+                    failure_codes=", ".join(item.get("failure_codes", [])),
+                )
+            )
+        lines.append("")
+
+    changed_files = list(report.get("changed_files", []))
+    if changed_files:
+        lines.append("## Changed Files")
+        lines.append("")
+        for file_name in changed_files:
+            lines.append(f"- {file_name}")
+        lines.append("")
+
+    failures = list(report.get("failure_codes", []))
+    if failures:
+        lines.append("## Failures")
+        lines.append("")
+        for failure in failures:
+            lines.append(f"- {failure}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _save_generated_artifact_verification_report(
+    report: Any, verification_dir: Path
+) -> Tuple[Path, Path]:
+    verification_dir.mkdir(parents=True, exist_ok=True)
+    report_data = _coerce_generated_artifact_verification_report(report)
+    json_path = verification_dir / "verification_report.json"
+    markdown_path = verification_dir / "verification_summary.md"
+
+    with open(json_path, "w", encoding="utf-8") as json_file:
+        json.dump(report_data, json_file, ensure_ascii=False, indent=2, sort_keys=True)
+
+    with open(markdown_path, "w", encoding="utf-8") as markdown_file:
+        markdown_file.write(_render_generated_artifact_verification_summary(report_data))
+
+    return json_path, markdown_path
 
 
 # -----------------------------------------------------------------------------
@@ -1048,6 +1417,64 @@ async def _handle_mcp_generation(
     mcpserver_path, mcp_usage = await _generate_mcp_server(
         evaluation, openapi_spec_dict, output_config, model=model
     )
+
+    verification_settings = _resolve_generated_artifact_verification_settings(args)
+    if verification_settings["verify_enabled"]:
+        if not mcpserver_path:
+            raise MCPGenerationError(
+                "generated artifact directory does not exist for verification"
+            )
+        if not mcpserver_path.exists():
+            raise MCPGenerationError(
+                f"generated artifact directory does not exist: {mcpserver_path}"
+            )
+
+        verification_kwargs = {
+            "seed": verification_settings["seed"],
+            "timeout_seconds": verification_settings["timeout_seconds"],
+        }
+        if verification_settings["repair_enabled"]:
+            repairer = _create_generated_artifact_repairer()
+            verification_report = await verify_with_repair(
+                openapi_spec_dict,
+                mcpserver_path,
+                repairer=repairer,
+                max_repair_attempts=verification_settings["repair_attempts"],
+                **verification_kwargs,
+            )
+        else:
+            verification_report = await verify_generated_artifacts(
+                openapi_spec_dict,
+                mcpserver_path,
+                **verification_kwargs,
+            )
+
+        verification_report_data = _coerce_generated_artifact_verification_report(
+            verification_report
+        )
+
+        verification_dir = mcpserver_path / "verification"
+        verification_json_path, verification_markdown_path = (
+            _save_generated_artifact_verification_report(
+                verification_report, verification_dir
+            )
+        )
+        mcp_usage["generated_artifact_verification"] = (
+            _build_generated_artifact_verification_metadata(
+                verification_report_data,
+                verification_json_path,
+                verification_markdown_path,
+            )
+        )
+
+        if verification_report_data.get("status") != "passed":
+            mcp_usage["generation_status"] = "failed"
+            mcp_usage["validation_errors"] = [
+                failure_code
+                for failure_code in _extract_failure_codes(
+                    verification_report_data.get("failures", [])
+                )
+            ] or ["generated artifact verification failed"]
 
     if mcp_usage:
         _update_evaluation_with_mcp_usage(

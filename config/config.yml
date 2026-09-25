@@ -23,6 +23,11 @@ debug: false
 # Evaluation Thresholds
 good_evaluation_threshold: 3.0  # Minimum score for "good" evaluation
 generate_mcp_threshold: 3.0     # Minimum score to generate MCP server
+generated_verification_enabled: false
+generated_verification_seed: 0
+generated_verification_timeout_seconds: 30
+generated_repair_enabled: false
+generated_repair_max_attempts: 2
 
 # Directory Configuration
 templates_dir: ./templates

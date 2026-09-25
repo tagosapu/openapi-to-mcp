@@ -4,6 +4,8 @@
 
 **Goal:** OpenAPI仕様を変更せず、生成されたMCP server/client/runtimeを仕様ベースのローカルモックで自動動作検証し、失敗時だけ生成物を最大2回まで限定修正できるワークフローを追加する。
 
+**Review Fix Round (Task 6):** Candidate isolation now checks the live original artifact tree around each repair call and restores it before any continuation if a repairer mutates it. The LLM repair prompt now uses a deliberately sanitized verification report that drops free-form messages and masks secret-like environment values.
+
 **Architecture:** OpenAPI仕様を不変の契約としてハッシュ化し、既存の`OperationMetadata`を使って操作ごとの入力値・成功応答・エラー応答を決定的に生成する。ローカルモックAPIはリクエストを記録し、生成MCP serverを経由した実際のHTTPリクエストとresponse schemaを検証する。修正はOpenAPIへ適用せず、`server.py`、`client.py`、`runtime.py`の候補コピーだけに対して回数制限付きで行い、再検証に通った候補だけを採用する。
 
 **Tech Stack:** Python 3.11+、uv、Pydantic v2、FastAPI、Uvicorn、httpx、jsonschema、FastMCP、pytest、pytest-asyncio。新しい外部依存は追加せず、既存の`jsonschema`、`httpx`、FastAPI/Uvicorn、MCP clientを再利用する。
@@ -81,6 +83,8 @@ class MockOperationScenario:
     response_headers: dict[str, str]
     response_body: Any | None
     scenario_kind: Literal["success", "http_error"]
+    validation_status: Literal["ready", "unvalidated", "skipped"] = "ready"
+    validation_reason: str | None = None
 
 
 def build_mock_scenarios(
@@ -97,6 +101,11 @@ def generate_schema_value(
     seed: int,
     path: str = "$",
 ) -> Any: ...
+
+
+class MockDataGenerationError(ValueError):
+    path: str
+    reason: str
 ```
 
 ```python
@@ -117,10 +126,12 @@ class OpenAPIMockServer:
         *,
         host: str = "127.0.0.1",
         port: int = 0,
+        secret_values: Sequence[str] = (),
     ) -> None: ...
 
     def start(self) -> str: ...
     def stop(self) -> None: ...
+    def activate_scenario(self, scenario: MockOperationScenario) -> None: ...
     def requests(self) -> list[RecordedRequest]: ...
 ```
 
@@ -150,7 +161,19 @@ async def verify_with_repair(
 class GeneratedArtifactRepairer(Protocol):
     async def repair(
         self,
-        artifact_dir: Path,
+        candidate_dir: Path,
+        openapi_spec: Mapping[str, Any],
+        report: GeneratedArtifactVerificationResult,
+        attempt: int,
+    ) -> RepairAttemptResult: ...
+
+
+class LLMGeneratedArtifactRepairer:
+    def __init__(self, llm_client: Any) -> None: ...
+
+    async def repair(
+        self,
+        candidate_dir: Path,
         openapi_spec: Mapping[str, Any],
         report: GeneratedArtifactVerificationResult,
         attempt: int,
@@ -314,7 +337,7 @@ Expected: FAIL for missing value factory and scenario builder.
 
 - [ ] **Step 4: Implement the value factory**
 
-Implement `generate_schema_value()` with a stable local `random.Random(seed)` derived from the schema path. Resolve local `$ref` values from `components.schemas`. Support string, integer, number, boolean, object, array, nullable, `oneOf`/`anyOf` first valid branch, `minLength`, `maxLength`, `minimum`, `maximum`, `minItems`, `maxItems`, `pattern` only for simple literal-safe patterns, and `additionalProperties` when explicitly described. Use fixed values for `date`, `date-time`, `uuid`, and email formats. When a schema cannot be represented, return a structured generation failure rather than inventing an unconstrained value.
+Implement `generate_schema_value()` with a stable local `random.Random(seed)` derived from the schema path. Resolve local `$ref` values from `components.schemas`. Support string, integer, number, boolean, object, array, nullable, `oneOf`/`anyOf` first valid branch, `minLength`, `maxLength`, `minimum`, `maximum`, `minItems`, `maxItems`, `pattern` only for simple literal-safe patterns, and `additionalProperties` when explicitly described. Use fixed values for `date`, `date-time`, `uuid`, and email formats. When a schema cannot be represented, raise `MockDataGenerationError` with the JSON path and reason; the scenario builder must convert that error into `validation_status="unvalidated"` and a redacted `validation_reason` rather than inventing an unconstrained value.
 
 - [ ] **Step 5: Implement operation scenarios**
 
@@ -331,7 +354,7 @@ def test_same_seed_produces_identical_scenarios():
     assert first == second
 ```
 
-Also assert that an operation without a request or response schema produces an explicit `unvalidated` reason, not a successful schema validation.
+Also assert that an operation without a request or response schema produces `validation_status="unvalidated"` and an explicit reason, not a successful schema validation.
 
 - [ ] **Step 7: Run the focused tests**
 
@@ -347,7 +370,7 @@ Expected: PASS.
 
 **Interfaces:**
 - Consume: `MockOperationScenario` from `src/services/openapi_mock_data.py`.
-- Produce: `OpenAPIMockServer.start() -> str`, `stop() -> None`, and `requests() -> list[RecordedRequest]`.
+- Produce: `OpenAPIMockServer.start() -> str`, `stop() -> None`, `activate_scenario(scenario) -> None`, and `requests() -> list[RecordedRequest]`.
 
 - [ ] **Step 1: Write failing tests for route matching and response selection**
 
@@ -388,7 +411,7 @@ Expected: FAIL because the server and recorder do not exist.
 
 - [ ] **Step 4: Implement the local server**
 
-Use FastAPI and Uvicorn on `127.0.0.1` with port `0`, expose a catch-all route, expand path templates into a safe matcher, select a scenario by method and normalized path, parse JSON bodies when possible, and return the scenario status, headers, and body. Start Uvicorn in a daemon thread and wait for the socket before returning the base URL. `stop()` must be idempotent and join the server thread.
+Use FastAPI and Uvicorn on `127.0.0.1` with port `0`, expose a catch-all route, expand path templates into a safe matcher, parse JSON bodies when possible, and return the active scenario's status, headers, and body. `activate_scenario()` must accept only a scenario supplied at construction and make it the sole response for its method/path until another scenario is activated; this allows success and documented HTTP-error cases to share a route without first-match masking. Start Uvicorn in a daemon thread and wait for the socket before returning the base URL. `stop()` must be idempotent and join the server thread.
 
 - [ ] **Step 5: Implement request redaction**
 
@@ -405,6 +428,8 @@ Expected: PASS.
 **Files:**
 - Create: `src/services/generated_artifact_verifier.py`
 - Create: `tests/test_generated_artifact_verifier.py`
+- Modify: `src/services/openapi_mock_server.py` for verifier-provided secret-value redaction
+- Modify: `src/__init__.py` to keep package import free of eager CLI/network work
 - Modify: `src/services/mcp_generator.py` only if verification metadata needs a backward-compatible field
 
 **Interfaces:**
@@ -439,7 +464,7 @@ Expected: FAIL because the verifier orchestration is not implemented.
 
 - [ ] **Step 3: Implement process orchestration**
 
-Generate scenarios, start the mock API, choose free localhost ports, start the generated `server.py` with `--transport streamable-http` and `--base-url`, wait for its MCP endpoint, and invoke each generated tool through the generated `client.py`. Use the existing subprocess pattern from `tests/test_kintone_mcp_e2e.py`. Set `trust_env=False` behavior and `NO_PROXY` for localhost. Always terminate child processes and the mock server in `finally` blocks.
+Generate scenarios, start the mock API, choose free localhost ports, start the generated `server.py` with `--transport streamable-http` and `--base-url`, wait for its MCP endpoint, and invoke each generated tool through the generated `client.py`. Before each scenario invocation, call `activate_scenario()` so success and error cases for the same operation are selected explicitly. Pass only secret-like environment values to the mock recorder's `secret_values` allowlist; redact sensitive query keys and exact secret values recursively in query/body data. Keep importing the verifier free of eager CLI initialization or network access by making the package-level `main_cli` export lazy. Use the existing subprocess pattern from `tests/test_kintone_mcp_e2e.py`. Set `trust_env=False` behavior and `NO_PROXY` for localhost. Always terminate child processes and the mock server in `finally` blocks.
 
 - [ ] **Step 4: Validate outbound requests**
 
@@ -503,7 +528,7 @@ Expected: PASS.
 - Modify: `src/services/generated_artifact_verifier.py`
 
 **Interfaces:**
-- `GeneratedArtifactRepairer.repair()` accepts only the immutable OpenAPI mapping, the failed report, an attempt number, and an artifact directory.
+- `GeneratedArtifactRepairer.repair()` accepts only the immutable OpenAPI mapping, the failed report, an attempt number, and an explicit candidate directory.
 - `verify_with_repair()` returns the same `GeneratedArtifactVerificationResult` shape regardless of whether repair was attempted.
 
 - [ ] **Step 1: Write failing tests for candidate isolation and acceptance**
@@ -541,9 +566,9 @@ Expected: FAIL because candidate directories, repair protocol, and orchestration
 
 Before the first repair, snapshot the allowlisted generated files and compute their hashes. For each attempt, copy artifacts to `.verification/attempt-{n}`. A repairer may write only `server.py`, `client.py`, or `runtime.py` inside that candidate directory. Reject path traversal, new executable files, changes to `requirements.txt` or documentation, and changes to the OpenAPI input.
 
-- [ ] **Step 4: Implement a deterministic fake-compatible repair interface**
+- [ ] **Step 4: Implement the repair interfaces**
 
-The default production workflow must be able to use a repair strategy without coupling the verifier to an LLM. Define a `GeneratedArtifactRepairer` protocol and a `NoOpRepairer` that records why it cannot repair. Tests use `FakeRepairer`; later an LLM adapter can implement the same protocol. The repair prompt/adapter, if enabled later, must receive the redacted report and allowlisted file contents only.
+Define a `GeneratedArtifactRepairer` protocol and a `NoOpRepairer` that records why it cannot repair. Implement `LLMGeneratedArtifactRepairer` using the existing LLM client. It must send only the redacted verification report and allowlisted candidate source files, require a JSON response shaped as `{"files": {"server.py": "...", "client.py": "...", "runtime.py": "..."}}`, reject all other file names, and never include the OpenAPI specification or credentials in the repair prompt. Tests use `FakeRepairer` for deterministic candidate changes and a fake LLM response for response parsing.
 
 - [ ] **Step 5: Implement bounded retry and acceptance rules**
 

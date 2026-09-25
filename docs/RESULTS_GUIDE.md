@@ -18,7 +18,10 @@ results_YYYYMMDD_HHMMSS_<spec-name>_<provider>/
     ├── client.py                         # MCP client for testing
     ├── requirements.txt                  # Python dependencies
     ├── README.md                         # Usage instructions
-    └── tool_spec.txt                     # Tool specifications
+  ├── tool_spec.txt                     # Tool specifications
+  └── verification/                     # Generated-artifact verification output
+    ├── verification_report.json      # Deterministic machine-readable report
+    └── verification_summary.md       # Human-readable verification summary
 ```
 
 ## File Descriptions
@@ -127,6 +130,14 @@ Detailed specifications for each generated MCP tool including:
 - Parameter types and constraints
 - Expected response format
 
+#### `mcpserver/verification/verification_report.json`
+
+Deterministic JSON produced after generated-artifact verification. It includes the spec hash, seed, generator version, operation status summaries, bounded repair attempts, and changed file names. It is written with stable key ordering and excludes raw authorization headers, tokens, passwords, and subprocess logs.
+
+#### `mcpserver/verification/verification_summary.md`
+
+A developer-friendly markdown summary of the verification run. It mirrors the JSON report in a readable format and highlights overall status, file checks, operation statuses, repair attempts, and failures.
+
 ## Quality Thresholds
 
 The converter uses these thresholds to determine if MCP generation should proceed:
@@ -134,6 +145,8 @@ The converter uses these thresholds to determine if MCP generation should procee
 - **AI Readiness Score**: Must be ≥ 3/5
 
 Both scores must meet the threshold for MCP server generation. If not met, the evaluation report will contain specific suggestions for improving your OpenAPI specification.
+
+When generated-artifact verification is enabled, a failed verification does not replace the original OpenAPI input. The generation result is marked as failed and the verification report is still written under `mcpserver/verification/`.
 
 ## Pre-Generated Sample Results
 
