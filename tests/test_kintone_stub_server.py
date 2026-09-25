@@ -3,10 +3,48 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from examples.kintone_stub_server import app
+from examples.kintone_stub_server import KINTONE_APP_FIELDS, app
 
 client = TestClient(app)
 HEADERS = {"X-Cybozu-API-Token": "mock-token"}
+
+
+def _valid_record(invoice_number: str = "INV-TEST-002") -> dict[str, object]:
+    return {
+        "invoice_number": {
+            "type": "SINGLE_LINE_TEXT",
+            "value": invoice_number,
+        },
+        "invoice_date": {"type": "DATE", "value": "2026-09-20"},
+        "vendor_name": {"type": "SINGLE_LINE_TEXT", "value": "Test Vendor"},
+        "subtotal": {"type": "NUMBER", "value": "10000"},
+        "tax_amount": {"type": "NUMBER", "value": "1000"},
+        "total_amount": {"type": "NUMBER", "value": "11000"},
+        "currency": {"type": "DROP_DOWN", "value": "JPY"},
+        "status": {"type": "DROP_DOWN", "value": "registered"},
+        "ocr_confidence": {"type": "NUMBER", "value": "0.95"},
+        "source_file": {"type": "SINGLE_LINE_TEXT", "value": "test.pdf"},
+        "ocr_text_ref": {
+            "type": "SINGLE_LINE_TEXT",
+            "value": "object://ocr-text/test-002",
+        },
+        "line_items": {
+            "type": "SUBTABLE",
+            "value": [
+                {
+                    "value": {
+                        "description": {
+                            "type": "SINGLE_LINE_TEXT",
+                            "value": "Test item",
+                        },
+                        "quantity": {"type": "NUMBER", "value": "1"},
+                        "unit_price": {"type": "NUMBER", "value": "10000"},
+                        "amount": {"type": "NUMBER", "value": "10000"},
+                    }
+                }
+            ],
+        },
+    }
 
 
 def setup_function() -> None:
@@ -32,15 +70,7 @@ def test_record_crud_and_request_log() -> None:
 
     response = client.post(
         "/k/v1/records.json",
-        json={
-            "app": 1,
-            "records": [
-                {
-                    "ocr_id": {"type": "SINGLE_LINE_TEXT", "value": "ocr-002"},
-                    "status": {"type": "DROP_DOWN", "value": "registered"},
-                }
-            ],
-        },
+        json={"app": 1, "records": [_valid_record()]},
         headers=HEADERS,
     )
     assert response.status_code == 200
@@ -50,7 +80,7 @@ def test_record_crud_and_request_log() -> None:
         "/k/v1/record.json",
         json={
             "app": 1,
-            "id": record_id,
+            "updateKey": {"field": "invoice_number", "value": "INV-TEST-002"},
             "record": {"status": {"value": "processed"}},
         },
         headers=HEADERS,
@@ -122,25 +152,69 @@ def test_get_over_post_matches_get_records() -> None:
     assert response.json() == expected
 
 
-def test_transfer_validation_rejects_invalid_record_without_partial_write() -> None:
+def test_app_form_fields_match_target_and_unknown_codes_are_ignored() -> None:
+    response = client.get(
+        "/k/v1/app/form/fields.json",
+        params={"app": 1},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    properties = response.json()["properties"]
+    assert properties["invoice_number"]["type"] == "SINGLE_LINE_TEXT"
+    assert properties["invoice_number"]["unique"] is True
+    assert properties["line_items"]["type"] == "SUBTABLE"
+    assert "document_id" not in properties
+    assert set(properties) == set(KINTONE_APP_FIELDS)
+
+    record = _valid_record("INV-UNKNOWN-FIELD")
+    record["document_id"] = {
+        "type": "SINGLE_LINE_TEXT",
+        "value": "ocr-only-metadata",
+    }
+    created = client.post(
+        "/k/v1/records.json",
+        json={"app": 1, "records": [record]},
+        headers=HEADERS,
+    )
+    assert created.status_code == 200
+
+    stored = client.get(
+        "/k/v1/record.json",
+        params={"app": 1, "id": created.json()["ids"][0]},
+        headers=HEADERS,
+    )
+    assert stored.status_code == 200
+    assert "document_id" not in stored.json()["record"]
+
+
+def test_number_field_values_must_follow_kintone_string_shape() -> None:
+    record = _valid_record("INV-NUMBER-SHAPE")
+    record["total_amount"] = {"type": "NUMBER", "value": 11000}
+
     response = client.post(
         "/k/v1/records.json",
-        json={
-            "app": 1,
-            "records": [
-                {
-                    "document_id": {
-                        "type": "SINGLE_LINE_TEXT",
-                        "value": "",
-                    },
-                    "text": {
-                        "type": "MULTI_LINE_TEXT",
-                        "value": "invalid document",
-                    },
-                    "status": {"type": "DROP_DOWN", "value": "registered"},
-                }
-            ],
-        },
+        json={"app": 1, "records": [record]},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "code": "MOCK_RE03",
+        "id": "mock-error",
+        "message": "total_amount must be a string number",
+    }
+
+
+def test_transfer_validation_rejects_invalid_record_without_partial_write() -> None:
+    invalid_record = _valid_record("INV-MISSING-NUMBER")
+    invalid_record["invoice_number"] = {
+        "type": "SINGLE_LINE_TEXT",
+        "value": "",
+    }
+    response = client.post(
+        "/k/v1/records.json",
+        json={"app": 1, "records": [invalid_record]},
         headers=HEADERS,
     )
 
@@ -148,7 +222,7 @@ def test_transfer_validation_rejects_invalid_record_without_partial_write() -> N
     assert response.json() == {
         "code": "MOCK_RE02",
         "id": "mock-error",
-        "message": "document_id is required",
+        "message": "invoice_number is required",
     }
 
     records = client.get(

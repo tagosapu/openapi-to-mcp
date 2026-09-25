@@ -9,19 +9,12 @@ from pathlib import Path
 import httpx
 import yaml
 
+from examples.kintone_stub_server import KINTONE_APP_FIELDS
 from src.services.openapi_mcp_codegen import write_generated_artifacts
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC_PATH = ROOT / "input_data/openapi-spec-1/openapi.yaml"
 OCR_FIXTURE_PATH = ROOT / "examples/ocr/kintone-transfer.json"
-KINTONE_FIELD_TYPES = {
-    "document_id": "SINGLE_LINE_TEXT",
-    "text": "MULTI_LINE_TEXT",
-    "status": "DROP_DOWN",
-    "confidence": "NUMBER",
-    "source_file": "SINGLE_LINE_TEXT",
-    "note": "MULTI_LINE_TEXT",
-}
 
 
 def _free_port() -> int:
@@ -70,14 +63,85 @@ def _stop_process(process: subprocess.Popen[str]) -> None:
         process.stdout.read()
 
 
-def _to_kintone_record(source_record: dict[str, object]) -> dict[str, dict[str, object]]:
+def _field_payload(field_type: str, value: object) -> dict[str, object]:
+    normalized_value = str(value) if field_type == "NUMBER" else value
+    return {"type": field_type, "value": normalized_value}
+
+
+def _kintone_field(field_code: str, value: object) -> dict[str, object]:
+    return _field_payload(KINTONE_APP_FIELDS[field_code]["type"], value)
+
+
+def _source_value(fields: dict[str, dict[str, object]], field_code: str) -> object:
+    return fields[field_code]["value"]
+
+
+def _to_kintone_record(document: dict[str, object]) -> dict[str, dict[str, object]]:
+    ocr = document["ocr"]
+    source_fields = ocr["fields"]
+    line_items = []
+    line_item_fields = KINTONE_APP_FIELDS["line_items"]["fields"]
+    for source_item in ocr["line_items"]:
+        source_item_fields = source_item["fields"]
+        line_items.append(
+            {
+                "value": {
+                    field_code: _field_payload(
+                        line_item_fields[field_code]["type"],
+                        _source_value(source_item_fields, field_code),
+                    )
+                    for field_code in line_item_fields
+                }
+            }
+        )
+
+    confidence = min(
+        float(field["confidence"])
+        for field in source_fields.values()
+        if "confidence" in field
+    )
     return {
-        field_code: {
-            "type": KINTONE_FIELD_TYPES[field_code],
-            "value": value,
-        }
-        for field_code, value in source_record.items()
-        if field_code in KINTONE_FIELD_TYPES
+        "invoice_number": _kintone_field(
+            "invoice_number", _source_value(source_fields, "invoice_number")
+        ),
+        "invoice_date": _kintone_field(
+            "invoice_date", _source_value(source_fields, "invoice_date")
+        ),
+        "vendor_name": _kintone_field(
+            "vendor_name", _source_value(source_fields, "vendor_name")
+        ),
+        "subtotal": _kintone_field(
+            "subtotal", _source_value(source_fields, "subtotal")
+        ),
+        "tax_amount": _kintone_field(
+            "tax_amount", _source_value(source_fields, "tax_amount")
+        ),
+        "total_amount": _kintone_field(
+            "total_amount", _source_value(source_fields, "total_amount")
+        ),
+        "currency": _kintone_field(
+            "currency", _source_value(source_fields, "currency")
+        ),
+        "status": _kintone_field("status", "registered"),
+        "ocr_confidence": _kintone_field("ocr_confidence", confidence),
+        "source_file": _kintone_field(
+            "source_file", document["document"]["content"]["filename"]
+        ),
+        "ocr_text_ref": _kintone_field("ocr_text_ref", ocr["text_ref"]),
+        "line_items": {
+            "type": "SUBTABLE",
+            "value": line_items,
+        },
+    }
+
+
+def _to_kintone_record_values(
+    values: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    return {
+        field_code: _kintone_field(field_code, value)
+        for field_code, value in values.items()
+        if field_code in KINTONE_APP_FIELDS and field_code != "line_items"
     }
 
 
@@ -116,7 +180,8 @@ def _run_client(
 def test_generated_kintone_mcp_server_transfers_ocr_data(tmp_path):
     spec = yaml.safe_load(SPEC_PATH.read_text(encoding="utf-8"))
     ocr_data = json.loads(OCR_FIXTURE_PATH.read_text(encoding="utf-8"))
-    record_fields = [_to_kintone_record(record) for record in ocr_data["records"]]
+    documents = ocr_data["documents"]
+    record_fields = [_to_kintone_record(document) for document in documents]
     artifact_dir = tmp_path / "mcpserver"
     write_generated_artifacts(spec, artifact_dir)
 
@@ -170,6 +235,16 @@ def test_generated_kintone_mcp_server_transfers_ocr_data(tmp_path):
         client_env = {**base_env, "NO_PROXY": "127.0.0.1,localhost,::1"}
         server_url = f"http://127.0.0.1:{mcp_port}/mcp/"
 
+        target_schema = _run_client(
+            artifact_dir,
+            server_url,
+            "getAppFormFields",
+            {"app": ocr_data["app"]},
+            client_env,
+        )
+        assert "document_id" not in target_schema["properties"]
+        assert target_schema["properties"]["line_items"]["type"] == "SUBTABLE"
+
         created = _run_client(
             artifact_dir,
             server_url,
@@ -182,11 +257,15 @@ def test_generated_kintone_mcp_server_transfers_ocr_data(tmp_path):
             },
             client_env,
         )
-        assert len(created["ids"]) == len(ocr_data["records"])
-        assert len(created["revisions"]) == len(ocr_data["records"])
+        assert len(created["ids"]) == len(documents)
+        assert len(created["revisions"]) == len(documents)
         record_ids = created["ids"]
 
-        for record_id, source_record in zip(record_ids, ocr_data["records"]):
+        for record_id, source_document, expected_record in zip(
+            record_ids,
+            documents,
+            record_fields,
+        ):
             record = _run_client(
                 artifact_dir,
                 server_url,
@@ -194,35 +273,58 @@ def test_generated_kintone_mcp_server_transfers_ocr_data(tmp_path):
                 {"app": ocr_data["app"], "id": int(record_id)},
                 client_env,
             )
-            for field_code, value in source_record.items():
-                if field_code in KINTONE_FIELD_TYPES:
-                    assert record["record"][field_code]["value"] == value
+            for field_code, expected_field in expected_record.items():
+                actual_field = record["record"][field_code]
+                if field_code == "line_items":
+                    actual_rows = actual_field["value"]
+                    expected_rows = expected_field["value"]
+                    assert len(actual_rows) == len(expected_rows)
+                    for actual_row, expected_row in zip(actual_rows, expected_rows):
+                        assert actual_row["id"].isdigit()
+                        assert actual_row["value"] == expected_row["value"]
+                else:
+                    assert actual_field == expected_field
+            assert "document_id" not in record["record"]
+            assert (
+                record["record"]["invoice_number"]["value"]
+                == source_document["ocr"]["fields"]["invoice_number"]["value"]
+            )
 
         updated = _run_client(
             artifact_dir,
             server_url,
-            "putRecord",
+            "putRecords",
             {
                 "body": {
                     "app": ocr_data["app"],
-                    "updateKey": {
-                        "document_id": {"value": ocr_data["records"][0]["document_id"]}
-                    },
-                    "record": {"status": {"value": "processed"}},
+                    "records": [
+                        {
+                            "updateKey": {
+                                "field": "invoice_number",
+                                "value": document["ocr"]["fields"][
+                                    "invoice_number"
+                                ]["value"],
+                            },
+                            "record": {"status": {"value": "processed"}},
+                        }
+                        for document in documents
+                    ],
                 }
             },
             client_env,
         )
-        assert int(updated["revision"]) >= 2
+        assert [item["id"] for item in updated["records"]] == record_ids
+        assert all(int(item["revision"]) >= 2 for item in updated["records"])
 
-        processed = _run_client(
-            artifact_dir,
-            server_url,
-            "getRecord",
-            {"app": ocr_data["app"], "id": int(record_ids[0])},
-            client_env,
-        )
-        assert processed["record"]["status"]["value"] == "processed"
+        for record_id in record_ids:
+            processed = _run_client(
+                artifact_dir,
+                server_url,
+                "getRecord",
+                {"app": ocr_data["app"], "id": int(record_id)},
+                client_env,
+            )
+            assert processed["record"]["status"]["value"] == "processed"
 
         for abnormal in ocr_data["abnormal_records"]:
             invalid = _run_client(
@@ -232,7 +334,9 @@ def test_generated_kintone_mcp_server_transfers_ocr_data(tmp_path):
                 {
                     "body": {
                         "app": ocr_data["app"],
-                        "records": [_to_kintone_record(abnormal["record"])],
+                        "records": [
+                            _to_kintone_record_values(abnormal["record"])
+                        ],
                     }
                 },
                 client_env,

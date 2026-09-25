@@ -1,69 +1,365 @@
 {
   "app": 1,
-  "records": [
+  "documents": [
     {
-      "document_id": "ocr-e2e-001",
-      "text": "OCR transfer text\nInvoice total: 12800",
-      "status": "registered",
-      "confidence": 0.98,
-      "source_file": "invoice-001.png"
+      "schema_version": "ocr-transfer/v1",
+      "document": {
+        "document_id": "doc-invoice-0001",
+        "document_type": "invoice",
+        "source_system": "ocr-service-a",
+        "occurred_at": "2026-09-18T04:00:00Z",
+        "content": {
+          "media_type": "application/pdf",
+          "filename": "invoice-0001.pdf",
+          "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "storage_ref": "object://documents/doc-invoice-0001"
+        }
+      },
+      "ocr": {
+        "languages": ["ja"],
+        "text_ref": "object://ocr-text/doc-invoice-0001",
+        "fields": {
+          "invoice_number": {
+            "raw_value": "INV-0001",
+            "value": "INV-0001",
+            "value_type": "string",
+            "confidence": 0.98,
+            "status": "extracted"
+          },
+          "invoice_date": {
+            "raw_value": "2026/09/18",
+            "value": "2026-09-18",
+            "value_type": "date",
+            "confidence": 0.97,
+            "status": "extracted"
+          },
+          "vendor_name": {
+            "raw_value": "株式会社サンプル商事",
+            "value": "株式会社サンプル商事",
+            "value_type": "string",
+            "confidence": 0.96,
+            "status": "extracted"
+          },
+          "subtotal": {
+            "raw_value": "11,636",
+            "value": 11636,
+            "value_type": "number",
+            "confidence": 0.93,
+            "status": "extracted"
+          },
+          "tax_amount": {
+            "raw_value": "1,164",
+            "value": 1164,
+            "value_type": "number",
+            "confidence": 0.93,
+            "status": "extracted"
+          },
+          "total_amount": {
+            "raw_value": "12,800円",
+            "value": 12800,
+            "value_type": "currency",
+            "unit": "JPY",
+            "confidence": 0.95,
+            "status": "extracted"
+          },
+          "currency": {
+            "raw_value": "円",
+            "value": "JPY",
+            "value_type": "string",
+            "confidence": 0.99,
+            "status": "extracted"
+          }
+        },
+        "line_items": [
+          {
+            "fields": {
+              "description": {
+                "raw_value": "クラウド利用料",
+                "value": "クラウド利用料",
+                "value_type": "string",
+                "confidence": 0.96,
+                "status": "extracted"
+              },
+              "quantity": {
+                "raw_value": "2",
+                "value": 2,
+                "value_type": "integer",
+                "confidence": 0.99,
+                "status": "extracted"
+              },
+              "unit_price": {
+                "raw_value": "4,000",
+                "value": 4000,
+                "value_type": "number",
+                "confidence": 0.94,
+                "status": "extracted"
+              },
+              "amount": {
+                "raw_value": "8,000",
+                "value": 8000,
+                "value_type": "number",
+                "confidence": 0.94,
+                "status": "extracted"
+              }
+            }
+          },
+          {
+            "fields": {
+              "description": {
+                "raw_value": "保守サポート",
+                "value": "保守サポート",
+                "value_type": "string",
+                "confidence": 0.91,
+                "status": "extracted"
+              },
+              "quantity": {
+                "raw_value": "1",
+                "value": 1,
+                "value_type": "integer",
+                "confidence": 0.99,
+                "status": "extracted"
+              },
+              "unit_price": {
+                "raw_value": "3,636",
+                "value": 3636,
+                "value_type": "number",
+                "confidence": 0.92,
+                "status": "extracted"
+              },
+              "amount": {
+                "raw_value": "3,636",
+                "value": 3636,
+                "value_type": "number",
+                "confidence": 0.92,
+                "status": "extracted"
+              }
+            }
+          }
+        ]
+      },
+      "delivery": {
+        "connector_id": "invoice-target",
+        "mapping_id": "invoice-kintone-v1",
+        "operation": "upsert",
+        "deduplication_key_path": "/ocr/fields/invoice_number/value"
+      },
+      "metadata": {
+        "tenant_id": "tenant-a",
+        "correlation_id": "corr-invoice-0001",
+        "labels": {"department": "accounting"}
+      }
     },
     {
-      "document_id": "ocr-e2e-002",
-      "text": "請求書番号: INV-2026-002\n合計金額: 45000円",
-      "status": "registered",
-      "confidence": 0.91,
-      "source_file": "invoice-002.png"
-    },
-    {
-      "document_id": "ocr-e2e-003",
-      "text": "Low-confidence OCR result",
-      "status": "needs_review",
-      "confidence": 0.42,
-      "note": "手動確認が必要"
+      "schema_version": "ocr-transfer/v1",
+      "document": {
+        "document_id": "doc-invoice-0002",
+        "document_type": "invoice",
+        "source_system": "ocr-service-a",
+        "occurred_at": "2026-09-19T04:00:00Z",
+        "content": {
+          "media_type": "application/pdf",
+          "filename": "invoice-0002.pdf",
+          "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "storage_ref": "object://documents/doc-invoice-0002"
+        }
+      },
+      "ocr": {
+        "languages": ["ja"],
+        "text_ref": "object://ocr-text/doc-invoice-0002",
+        "fields": {
+          "invoice_number": {
+            "raw_value": "INV-0002",
+            "value": "INV-0002",
+            "value_type": "string",
+            "confidence": 0.95,
+            "status": "extracted"
+          },
+          "invoice_date": {
+            "raw_value": "2026/09/19",
+            "value": "2026-09-19",
+            "value_type": "date",
+            "confidence": 0.94,
+            "status": "extracted"
+          },
+          "vendor_name": {
+            "raw_value": "サンプルサービス株式会社",
+            "value": "サンプルサービス株式会社",
+            "value_type": "string",
+            "confidence": 0.89,
+            "status": "extracted"
+          },
+          "subtotal": {
+            "raw_value": "40,909",
+            "value": 40909,
+            "value_type": "number",
+            "confidence": 0.9,
+            "status": "extracted"
+          },
+          "tax_amount": {
+            "raw_value": "4,091",
+            "value": 4091,
+            "value_type": "number",
+            "confidence": 0.9,
+            "status": "extracted"
+          },
+          "total_amount": {
+            "raw_value": "45,000円",
+            "value": 45000,
+            "value_type": "currency",
+            "unit": "JPY",
+            "confidence": 0.91,
+            "status": "extracted"
+          },
+          "currency": {
+            "raw_value": "円",
+            "value": "JPY",
+            "value_type": "string",
+            "confidence": 0.98,
+            "status": "extracted"
+          }
+        },
+        "line_items": [
+          {
+            "fields": {
+              "description": {
+                "raw_value": "導入支援",
+                "value": "導入支援",
+                "value_type": "string",
+                "confidence": 0.9,
+                "status": "extracted"
+              },
+              "quantity": {
+                "raw_value": "1",
+                "value": 1,
+                "value_type": "integer",
+                "confidence": 0.98,
+                "status": "extracted"
+              },
+              "unit_price": {
+                "raw_value": "30,000",
+                "value": 30000,
+                "value_type": "number",
+                "confidence": 0.9,
+                "status": "extracted"
+              },
+              "amount": {
+                "raw_value": "30,000",
+                "value": 30000,
+                "value_type": "number",
+                "confidence": 0.9,
+                "status": "extracted"
+              }
+            }
+          },
+          {
+            "fields": {
+              "description": {
+                "raw_value": "設定作業",
+                "value": "設定作業",
+                "value_type": "string",
+                "confidence": 0.88,
+                "status": "extracted"
+              },
+              "quantity": {
+                "raw_value": "1",
+                "value": 1,
+                "value_type": "integer",
+                "confidence": 0.98,
+                "status": "extracted"
+              },
+              "unit_price": {
+                "raw_value": "10,909",
+                "value": 10909,
+                "value_type": "number",
+                "confidence": 0.88,
+                "status": "extracted"
+              },
+              "amount": {
+                "raw_value": "10,909",
+                "value": 10909,
+                "value_type": "number",
+                "confidence": 0.88,
+                "status": "extracted"
+              }
+            }
+          }
+        ]
+      },
+      "delivery": {
+        "connector_id": "invoice-target",
+        "mapping_id": "invoice-kintone-v1",
+        "operation": "upsert",
+        "deduplication_key_path": "/ocr/fields/invoice_number/value"
+      },
+      "metadata": {
+        "tenant_id": "tenant-a",
+        "correlation_id": "corr-invoice-0002",
+        "labels": {"department": "accounting"}
+      }
     }
   ],
   "abnormal_records": [
     {
-      "case": "missing_document_id",
+      "case": "missing_invoice_number",
       "record": {
-        "document_id": "",
-        "text": "OCR text without document id",
+        "invoice_number": "",
+        "invoice_date": "2026-09-20",
+        "vendor_name": "Invalid Vendor",
+        "subtotal": "10000",
+        "tax_amount": "1000",
+        "total_amount": "11000",
+        "currency": "JPY",
         "status": "registered",
-        "confidence": 0.88
+        "ocr_confidence": "0.98",
+        "source_file": "invalid-missing-number.pdf",
+        "ocr_text_ref": "object://ocr-text/invalid-missing-number"
       },
       "expected_error": {
         "status_code": 400,
         "target_code": "MOCK_RE02",
-        "message": "document_id is required"
+        "message": "invoice_number is required"
       }
     },
     {
       "case": "unsupported_status",
       "record": {
-        "document_id": "ocr-invalid-status",
-        "text": "OCR text with an unsupported status",
+        "invoice_number": "INV-INVALID-STATUS",
+        "invoice_date": "2026-09-20",
+        "vendor_name": "Invalid Vendor",
+        "subtotal": "10000",
+        "tax_amount": "1000",
+        "total_amount": "11000",
+        "currency": "JPY",
         "status": "unknown",
-        "confidence": 0.77
+        "ocr_confidence": "0.77",
+        "source_file": "invalid-status.pdf",
+        "ocr_text_ref": "object://ocr-text/invalid-status"
       },
       "expected_error": {
         "status_code": 400,
         "target_code": "MOCK_RE03",
-        "message": "status must be one of: registered, needs_review, processed"
+        "message": "status has an invalid option"
       }
     },
     {
       "case": "confidence_out_of_range",
       "record": {
-        "document_id": "ocr-invalid-confidence",
-        "text": "OCR text with an invalid confidence",
+        "invoice_number": "INV-INVALID-CONFIDENCE",
+        "invoice_date": "2026-09-20",
+        "vendor_name": "Invalid Vendor",
+        "subtotal": "10000",
+        "tax_amount": "1000",
+        "total_amount": "11000",
+        "currency": "JPY",
         "status": "registered",
-        "confidence": 1.2
+        "ocr_confidence": "1.2",
+        "source_file": "invalid-confidence.pdf",
+        "ocr_text_ref": "object://ocr-text/invalid-confidence"
       },
       "expected_error": {
         "status_code": 400,
         "target_code": "MOCK_RE03",
-        "message": "confidence must be between 0 and 1"
+        "message": "ocr_confidence must be between 0 and 1"
       }
     }
   ]
