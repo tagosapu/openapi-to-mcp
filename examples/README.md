@@ -41,8 +41,10 @@ MCP toolとして公開し、MCP clientがtool一覧と連携結果を取得し�
 ## ローカルKintoneモックへの転記確認
 
 `kintone_stub_server.py` は、メモリ上で動作するKintone互換バックエンドです。
-API token認証、アプリ情報、レコードの一覧・取得・登録・更新・削除、長いquery向け
-GET-over-POST、request historyを提供します。
+API token認証、アプリ情報、フォームフィールド定義、レコードの一覧・取得・登録・更新・削除、
+長いquery向けGET-over-POST、request historyを提供します。モックの請求書アプリでは、
+`invoice_number`を一意キー、`line_items`をサブテーブルとして定義しています。
+OCRの`document_id`は転記先フィールドではありません。
 
 `input_data/openapi-spec-1/openapi.yaml` から決定的に生成されたartifactは
 `results/azure/openapi/mcpserver/` にあります。OpenAPI operationごとにMCP toolを
@@ -70,12 +72,13 @@ uv run python results/azure/openapi/mcpserver/server.py \
 uv run python results/azure/openapi/mcpserver/client.py \
   --server-url http://127.0.0.1:9001/mcp/ \
   --tool postRecords \
-  --arguments '{"body":{"app":1,"records":[{"document_id":{"type":"SINGLE_LINE_TEXT","value":"ocr-e2e-001"},"text":{"type":"MULTI_LINE_TEXT","value":"OCR transfer text\nInvoice total: 12800"},"status":{"type":"DROP_DOWN","value":"registered"},"confidence":{"type":"NUMBER","value":0.98},"source_file":{"type":"SINGLE_LINE_TEXT","value":"invoice-001.png"}}]}}'
+  --arguments '{"body":{"app":1,"records":[{"invoice_number":{"type":"SINGLE_LINE_TEXT","value":"INV-0001"},"invoice_date":{"type":"DATE","value":"2026-09-18"},"vendor_name":{"type":"SINGLE_LINE_TEXT","value":"株式会社サンプル商事"},"subtotal":{"type":"NUMBER","value":"11636"},"tax_amount":{"type":"NUMBER","value":"1164"},"total_amount":{"type":"NUMBER","value":"12800"},"currency":{"type":"DROP_DOWN","value":"JPY"},"status":{"type":"DROP_DOWN","value":"registered"},"line_items":{"type":"SUBTABLE","value":[{"value":{"description":{"type":"SINGLE_LINE_TEXT","value":"クラウド利用料"},"quantity":{"type":"NUMBER","value":"2"},"unit_price":{"type":"NUMBER","value":"4000"},"amount":{"type":"NUMBER","value":"8000"}}}]}}]}}'
 ```
 
 送信する値は [`ocr/kintone-transfer.json`](ocr/kintone-transfer.json) にあります。
-fixtureには正常データ3件と、必須ID欠損・許可外status・信頼度範囲外の異常データ3件を
-含みます。`--tool` を省略するとtool一覧を取得できます。`API_BASE_URL` と
+fixtureには帳票2枚と、請求書番号欠損・許可外status・信頼度範囲外の異常データ3件を
+含みます。`document_id`はOCR側の追跡情報としてfixtureに残りますが、Kintone recordへは送信しません。
+`--tool` を省略するとtool一覧を取得できます。`API_BASE_URL` と
 `KINTONE_API_TOKEN` は生成serverが読み込みます。モックのrequest historyにはtoken値を
 記録せず、headerが存在したかどうかだけを記録します。
 

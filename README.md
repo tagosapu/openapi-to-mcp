@@ -115,6 +115,16 @@ openapi-to-mcp examples/sample_api.yaml --eval-only
 openapi-to-mcp examples/hello.yaml --output results/my-api-evaluation.json
 ```
 
+生成後は、既定で固定seedのモックデータを使ったローカルAPI検証を実行します。
+検証に失敗した場合は、`server.py`、`client.py`、`runtime.py`だけを対象に最大2回まで
+候補を修正し、全operationの再検証に通った候補だけを採用します。元のOpenAPI仕様は
+変更しません。検証結果は生成先の`mcpserver/verification/verification_report.json`と
+`verification_summary.md`に保存されます。
+
+自動検証・限定修正の設定は`config/config.yml`の
+`generated_verification_enabled`、`generated_repair_enabled`、
+`generated_repair_max_attempts`で変更できます。
+
 ## コマンドラインオプション
 
 ```text
@@ -127,6 +137,12 @@ openapi-to-mcp [OPTIONS] [FILENAME]
   --url URL              OpenAPI仕様を取得するURL
   --output FILE          結果の出力先
   --eval-only            評価だけを実行し、MCP生成を省略
+  --verify-generated     生成物のモック動作検証を有効化
+  --repair-generated     生成物の限定修正を有効化（検証も有効化）
+  --generated-verification-seed INTEGER
+                         モックデータ生成のseed
+  --generated-repair-attempts INTEGER
+                         限定修正の最大回数（0〜2）
   --verbose              詳細ログを有効化
   --show-env             環境設定を表示
 ```
@@ -193,21 +209,24 @@ connector、mapping、transferの登録例は、実際のtarget OpenAPI snapshot
 
 ローカルKintone互換mockを使い、OCRデータの転記から取得・更新・削除、異常データ拒否、HTTPエラー、通信エラー、token秘匿まで検証できます。実Kintoneには接続しません。
 
-fixtureは [examples/ocr/kintone-transfer.json](examples/ocr/kintone-transfer.json) です。正常データ3件を含みます。
+fixtureは [examples/ocr/kintone-transfer.json](examples/ocr/kintone-transfer.json) です。OCR標準形式の帳票2枚を含み、帳票1枚をKintoneの1レコードへまとめて転記します。
 
-| document_id | status | confidence | 内容 |
+`document.document_id` はOCR元の追跡用IDであり、Kintoneの標準フィールドではありません。このモックの請求書アプリ定義にも含めず、重複排除・更新キーにはアプリ側で一意設定した `invoice_number` を使います。実際のアプリフィールドは `getAppFormFields` (`/k/v1/app/form/fields.json`) で取得できます。
+
+| OCR document_id | invoice_number | 明細行 | 転記方法 |
 | --- | --- | ---: | --- |
-| `ocr-e2e-001` | `registered` | `0.98` | 英数字の請求書テキスト |
-| `ocr-e2e-002` | `registered` | `0.91` | 日本語の請求書テキスト |
-| `ocr-e2e-003` | `needs_review` | `0.42` | 手動確認が必要な低信頼度データ |
+| `doc-invoice-0001` | `INV-0001` | 2 | `postRecords`で一括登録 |
+| `doc-invoice-0002` | `INV-0002` | 2 | `postRecords`で一括登録 |
+
+モックの転記先フィールドは `invoice_number`、`invoice_date`、`vendor_name`、`subtotal`、`tax_amount`、`total_amount`、`currency`、`status`、`ocr_confidence`、`source_file`、`ocr_text_ref`、`line_items`（サブテーブル）です。Kintoneの `NUMBER` とサブテーブル内の数値は `value` を文字列で送ります。
 
 異常データもfixtureに3件あります。
 
 | case | 異常内容 | 応答 |
 | --- | --- | --- |
-| `missing_document_id` | document IDが空 | `400 / MOCK_RE02` |
+| `missing_invoice_number` | Kintone一意キーの請求書番号が空 | `400 / MOCK_RE02` |
 | `unsupported_status` | statusが`unknown` | `400 / MOCK_RE03` |
-| `confidence_out_of_range` | confidenceが`1.2` | `400 / MOCK_RE03` |
+| `confidence_out_of_range` | OCR信頼度が`1.2` | `400 / MOCK_RE03` |
 
 ### 3つの端末で実行する場合
 
@@ -226,16 +245,16 @@ uv run python results/azure/openapi/mcpserver/server.py \
   --port 9001 --transport streamable-http
 ```
 
-端末3で正常データの1件目を送信します。
+端末3で帳票1枚分のrecordを送信します。複数帳票をまとめる場合は、同じ `records` 配列へrecordを追加します。
 
 ```bash
 uv run python results/azure/openapi/mcpserver/client.py \
   --server-url http://127.0.0.1:9001/mcp/ \
   --tool postRecords \
-  --arguments '{"body":{"app":1,"records":[{"document_id":{"type":"SINGLE_LINE_TEXT","value":"ocr-e2e-001"},"text":{"type":"MULTI_LINE_TEXT","value":"OCR transfer text\nInvoice total: 12800"},"status":{"type":"DROP_DOWN","value":"registered"},"confidence":{"type":"NUMBER","value":0.98},"source_file":{"type":"SINGLE_LINE_TEXT","value":"invoice-001.png"}}]}}'
+  --arguments '{"body":{"app":1,"records":[{"invoice_number":{"type":"SINGLE_LINE_TEXT","value":"INV-0001"},"invoice_date":{"type":"DATE","value":"2026-09-18"},"vendor_name":{"type":"SINGLE_LINE_TEXT","value":"株式会社サンプル商事"},"subtotal":{"type":"NUMBER","value":"11636"},"tax_amount":{"type":"NUMBER","value":"1164"},"total_amount":{"type":"NUMBER","value":"12800"},"currency":{"type":"DROP_DOWN","value":"JPY"},"status":{"type":"DROP_DOWN","value":"registered"},"line_items":{"type":"SUBTABLE","value":[{"value":{"description":{"type":"SINGLE_LINE_TEXT","value":"クラウド利用料"},"quantity":{"type":"NUMBER","value":"2"},"unit_price":{"type":"NUMBER","value":"4000"},"amount":{"type":"NUMBER","value":"8000"}}}]}}]}}'
 ```
 
-正常データ3件と異常データ3件をまとめて検証する場合は、次のE2Eを実行します。
+帳票2件の一括登録、一括更新、フォーム定義取得、異常データ3件、削除、404、接続エラーをまとめて検証する場合は、次のE2Eを実行します。
 
 ```bash
 uv run pytest tests/test_kintone_stub_server.py tests/test_kintone_mcp_e2e.py -q
@@ -244,10 +263,14 @@ uv run pytest tests/test_kintone_stub_server.py tests/test_kintone_mcp_e2e.py -q
 現在の実測結果は次のとおりです。
 
 ```text
-11 passed, 1 warning
+13 passed, 1 warning
 ```
 
 実際の入力JSON、Kintone field形式への変換、登録応答、取得結果、異常応答、404、接続エラーは [docs/KINTONE_MCP_MOCK_RESULTS.md](docs/KINTONE_MCP_MOCK_RESULTS.md) に掲載しています。Pydanticのwarningはなく、残るwarningはStarlette / AnyIO依存関係由来です。
+
+Kintoneの請求書fixtureは動的フォームとOCR固有の一括転記を含むため、汎用のschemaベース
+検証とは別にこのE2Eで検証します。生成CLIの自動検証レポートにはOpenAPIで表現できる
+operation契約が入り、請求書fixtureの実測結果はこのE2Eと上記ドキュメントで確認します。
 
 request historyは次で取得できます。
 

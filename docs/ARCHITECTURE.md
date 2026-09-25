@@ -4,7 +4,7 @@
 
 このプロジェクトは、OpenAPI / Swagger仕様からMCPサーバーとMCPクライアントを作ります。通常の生成方法は決定的なコード生成です。同じOpenAPI仕様からは、API操作の順序、MCPツール名、HTTPリクエストの組み立てが同じになるように設計されています。
 
-LLMを使う場合は、仕様の内容を調べて評価し、説明不足・例不足・エラー説明不足などの改善案をまとめます。大きな仕様は分割して評価し、一時的なLLMエラーが起きた場合だけ上限付きで再試行します。評価結果を無制限に再評価するループはありません。MCP生成はOpenAPIの構造を直接整理して行い、生成後にPython構文、FastMCPの起動点、API操作数とMCPツール数、fallback生成物でないことを検証します。
+LLMを使う場合は、仕様の内容を調べて評価し、説明不足・例不足・エラー説明不足などの改善案をまとめます。大きな仕様は分割して評価し、一時的なLLMエラーが起きた場合だけ上限付きで再試行します。評価結果を無制限に再評価するループはありません。MCP生成はOpenAPIの構造を直接整理して行い、生成後にPython構文、FastMCPの起動点、API操作数とMCPツール数、fallback生成物でないことを検証します。さらに既定で固定seedのモックAPIを使った動作検証を行い、失敗時だけ生成物を最大2回まで限定修正します。
 
 ## システム構成
 
@@ -187,6 +187,39 @@ flowchart TD
 ```
 
 このフローでは、OpenAPIのAPI操作1件につきMCPツールを1つ作ります。`operationId`がない場合はHTTP methodとpathから名前を作り、重複する名前やPython予約語は衝突しないように調整します。生成後は、Python構文、FastMCPのimport、`main()`、API操作数とMCPツール数、fallback生成物でないことを確認します。
+
+### 4. 生成物の動作検証と限定修正
+
+生成CLIは次の順序で生成物を判定します。
+
+```mermaid
+flowchart TD
+  A[OpenAPI仕様を読み込む] --> B[決定的MCP生成]
+  B --> C[静的検証]
+  C --> D[固定seedのmock data生成]
+  D --> E[ローカルmock API起動]
+  E --> F[生成clientから全toolを実行]
+  F --> G[requestとresponse契約を検証]
+  G --> H{全operationがpassedか}
+  H -->|はい| I[検証レポートを保存し生成成功]
+  H -->|いいえ| J{修正試行が2回未満か}
+  J -->|はい| K[allowlist候補を修正]
+  K --> C
+  J -->|いいえ| L[元の生成物を保持し生成失敗]
+```
+
+モック値は`example`、`enum`、`default`、schema制約、ローカル`$ref`を優先して決定的に
+生成します。requestのmethod、path、query、bodyと、成功・HTTPエラー・接続・timeout・
+invalid JSONの結果を検証し、schemaがない箇所は`unvalidated`として成功扱いにしません。
+
+修正対象は`server.py`、`client.py`、`runtime.py`だけです。候補を全検証する前に元の
+生成物へ反映せず、OpenAPI入力と`enhanced_openapi_spec`は変更しません。結果は
+`mcpserver/verification/verification_report.json`と`verification_summary.md`に保存し、
+失敗時も評価結果へ検証status・failure code・修正試行数を記録します。
+
+Kintoneの請求書転記のように、動的フォームや業務状態遷移がOpenAPIに表現されない場合は、
+[`tests/test_kintone_mcp_e2e.py`](../tests/test_kintone_mcp_e2e.py)のfixture駆動E2Eを別途実行
+します。汎用検証が業務ルールを推測してOpenAPIを変更することはありません。
 
 #### API操作を整理する
 

@@ -1,8 +1,7 @@
 # Kintone MCP モック検証結果
 
-この文書は、OCRデータを決定的に生成されたMCP server経由でローカルの
-Kintone互換mockへ転記した結果です。値を追えるように、入力fixture、MCPへの
-リクエスト、実際の応答、異常データの応答を掲載しています。
+この文書は、OCR標準データの帳票を決定的に生成されたMCP server経由でローカルの
+Kintone互換mockへまとめて転記した結果です。実Kintoneには接続していません。
 
 ## 1. 検証構成
 
@@ -13,96 +12,52 @@ Kintone互換mockへ転記した結果です。値を追えるように、入力
 | MCP client | `results/azure/openapi/mcpserver/client.py` |
 | 転記先mock | [`examples/kintone_stub_server.py`](../examples/kintone_stub_server.py) |
 | MCP transport | `streamable-http` |
-| MCP endpoint | `http://127.0.0.1:9001/mcp/` |
 | 転記先API | `http://127.0.0.1:9100` |
 
-転記先データはmock processのメモリ上に保存されます。実Kintoneには接続せず、
-mock processを終了するとデータは破棄されます。
+mockのデータはプロセス内メモリに保存され、mockを終了すると破棄されます。
 
-## 2. 入力データ
+## 2. 転記先のKintoneアプリ定義
 
-### 正常データ3件
+KintoneのレコードフィールドはOpenAPIで固定されず、アプリごとに異なります。mockは
+`GET /k/v1/app/form/fields.json` で次の請求書アプリ定義を返します。
 
-| document_id | textの内容 | status | confidence | 追加項目 |
-| --- | --- | --- | ---: | --- |
-| `ocr-e2e-001` | 英数字と改行を含む請求書テキスト | `registered` | `0.98` | `invoice-001.png` |
-| `ocr-e2e-002` | 日本語と円記号を含む請求書テキスト | `registered` | `0.91` | `invoice-002.png` |
-| `ocr-e2e-003` | 認識精度が低いテキスト | `needs_review` | `0.42` | 手動確認メモ |
-
-fixtureの正常データは次の形です。
-
-```json
-{
-  "app": 1,
-  "records": [
-    {
-      "document_id": "ocr-e2e-001",
-      "text": "OCR transfer text\nInvoice total: 12800",
-      "status": "registered",
-      "confidence": 0.98,
-      "source_file": "invoice-001.png"
-    },
-    {
-      "document_id": "ocr-e2e-002",
-      "text": "請求書番号: INV-2026-002\n合計金額: 45000円",
-      "status": "registered",
-      "confidence": 0.91,
-      "source_file": "invoice-002.png"
-    },
-    {
-      "document_id": "ocr-e2e-003",
-      "text": "Low-confidence OCR result",
-      "status": "needs_review",
-      "confidence": 0.42,
-      "note": "手動確認が必要"
-    }
-  ]
-}
-```
-
-### 異常データ3件
-
-| case | 異常内容 | 期待するmock応答 |
+| フィールドコード | Kintone type | 必須/用途 |
 | --- | --- | --- |
-| `missing_document_id` | `document_id` が空文字 | HTTP `400` / `MOCK_RE02` |
-| `unsupported_status` | `status` が `unknown` | HTTP `400` / `MOCK_RE03` |
-| `confidence_out_of_range` | `confidence` が `1.2` | HTTP `400` / `MOCK_RE03` |
+| `invoice_number` | `SINGLE_LINE_TEXT` | 必須・重複禁止・更新キー |
+| `invoice_date` | `DATE` | 必須 |
+| `vendor_name` | `SINGLE_LINE_TEXT` | 必須 |
+| `subtotal` | `NUMBER` | 必須。`value`は文字列 |
+| `tax_amount` | `NUMBER` | 必須。`value`は文字列 |
+| `total_amount` | `NUMBER` | 必須。`value`は文字列 |
+| `currency` | `DROP_DOWN` | 必須。`JPY`/`USD` |
+| `status` | `DROP_DOWN` | 必須。`registered`/`needs_review`/`processed` |
+| `ocr_confidence` | `NUMBER` | 0から1。`value`は文字列 |
+| `source_file` | `SINGLE_LINE_TEXT` | OCR元ファイル名 |
+| `ocr_text_ref` | `SINGLE_LINE_TEXT` | OCR本文のobject参照 |
+| `line_items` | `SUBTABLE` | `description`、`quantity`、`unit_price`、`amount` |
 
-異常データとして実際に送信したrecordの値は次のとおりです。
+`document_id` はOCR標準データの `document.document_id` であり、Kintone標準フィールド
+でもmockアプリのカスタムフィールドでもありません。転記recordには含めず、帳票の
+追跡と監査のために入力fixture側で保持します。Kintone側の重複排除・更新キーには
+一意設定した `invoice_number` を使います。
 
-```json
-[
-  {
-    "case": "missing_document_id",
-    "document_id": "",
-    "text": "OCR text without document id",
-    "status": "registered",
-    "confidence": 0.88
-  },
-  {
-    "case": "unsupported_status",
-    "document_id": "ocr-invalid-status",
-    "text": "OCR text with an unsupported status",
-    "status": "unknown",
-    "confidence": 0.77
-  },
-  {
-    "case": "confidence_out_of_range",
-    "document_id": "ocr-invalid-confidence",
-    "text": "OCR text with an invalid confidence",
-    "status": "registered",
-    "confidence": 1.2
-  }
-]
-```
+## 3. 入力データ
 
-異常データは正常3件とは別に1件ずつ送信します。1件でも不正ならそのリクエスト
-全体を拒否し、正常に登録済みのレコードは残ります。
+正常データは帳票2枚です。各帳票を1件のKintone recordへ変換し、2件を同じ
+`postRecords` の `records` 配列で送信します。
 
-## 3. MCPへ送ったデータ
+| OCR document_id | invoice_number | 合計 | 明細行 |
+| --- | --- | ---: | ---: |
+| `doc-invoice-0001` | `INV-0001` | `12800` JPY | 2 |
+| `doc-invoice-0002` | `INV-0002` | `45000` JPY | 2 |
 
-正常3件はKintoneのrecord field形式に変換して、`postRecords`へ送信します。
-代表的なリクエストは次の形式です。
+OCRの `raw_value` / `value` / `confidence` は転記マッピングで使い分けます。Kintoneの
+NUMBERフィールドには正規化した数値を文字列で送り、OCRの明細行はKintoneの
+SUBTABLE行へまとめます。
+
+## 4. MCPへ送ったデータ
+
+代表的な1件は次の形です。実際のE2Eでは、同じ形の2件を `records` 配列に入れます。
 
 ```json
 {
@@ -110,25 +65,27 @@ fixtureの正常データは次の形です。
     "app": 1,
     "records": [
       {
-        "document_id": {
-          "type": "SINGLE_LINE_TEXT",
-          "value": "ocr-e2e-001"
-        },
-        "text": {
-          "type": "MULTI_LINE_TEXT",
-          "value": "OCR transfer text\nInvoice total: 12800"
-        },
-        "status": {
-          "type": "DROP_DOWN",
-          "value": "registered"
-        },
-        "confidence": {
-          "type": "NUMBER",
-          "value": 0.98
-        },
-        "source_file": {
-          "type": "SINGLE_LINE_TEXT",
-          "value": "invoice-001.png"
+        "invoice_number": {"type": "SINGLE_LINE_TEXT", "value": "INV-0001"},
+        "invoice_date": {"type": "DATE", "value": "2026-09-18"},
+        "vendor_name": {"type": "SINGLE_LINE_TEXT", "value": "株式会社サンプル商事"},
+        "subtotal": {"type": "NUMBER", "value": "11636"},
+        "tax_amount": {"type": "NUMBER", "value": "1164"},
+        "total_amount": {"type": "NUMBER", "value": "12800"},
+        "currency": {"type": "DROP_DOWN", "value": "JPY"},
+        "status": {"type": "DROP_DOWN", "value": "registered"},
+        "ocr_confidence": {"type": "NUMBER", "value": "0.91"},
+        "source_file": {"type": "SINGLE_LINE_TEXT", "value": "invoice-0001.pdf"},
+        "ocr_text_ref": {"type": "SINGLE_LINE_TEXT", "value": "object://ocr-text/doc-invoice-0001"},
+        "line_items": {
+          "type": "SUBTABLE",
+          "value": [
+            {"value": {
+              "description": {"type": "SINGLE_LINE_TEXT", "value": "クラウド利用料"},
+              "quantity": {"type": "NUMBER", "value": "2"},
+              "unit_price": {"type": "NUMBER", "value": "4000"},
+              "amount": {"type": "NUMBER", "value": "8000"}
+            }}
+          ]
         }
       }
     ]
@@ -136,185 +93,89 @@ fixtureの正常データは次の形です。
 }
 ```
 
-E2Eではこの形式のrecordを3件まとめて送信しています。
+`document_id` はこのrecordにありません。未知のフィールドコードを送った場合も、
+Kintone仕様に合わせてmockはそのフィールドを無視します。
 
-## 4. 正常系の実際の出力
+## 5. 正常系の実測結果
 
-### 登録 (`postRecords`)
+### フォーム定義 (`getAppFormFields`)
 
-mockには初期レコードID `1` があるため、今回の実行では次の応答になります。
+生成MCP serverからフォーム定義を取得でき、`document_id` が存在しないこと、
+`line_items` が `SUBTABLE` であることを確認しました。
+
+### 一括登録 (`postRecords`)
+
+初期レコードID `1` があるため、帳票2件の登録結果は次の形になります。
 
 ```json
 {
-  "ids": ["2", "3", "4"],
-  "revisions": ["2", "3", "4"]
+  "ids": ["2", "3"],
+  "revisions": ["2", "3"]
 }
 ```
 
-### 取得 (`getRecord`)
+取得結果には `$id`、`$revision`、定義済みの請求書フィールド、Kintoneが生成した
+サブテーブル行IDが含まれます。`document_id` は保存されません。
 
-`ocr-e2e-001` の取得結果は次のようになります。`$id` と `$revision` はmockが
-付与するシステムフィールドです。
+### 一括更新 (`putRecords`)
+
+`invoice_number` を正式なKintone `updateKey` として、2件の `status` を同じリクエストで
+`processed` へ更新しました。
 
 ```json
 {
-  "record": {
-    "$id": {"type": "__ID__", "value": "2"},
-    "$revision": {"type": "__REVISION__", "value": "2"},
-    "document_id": {
-      "type": "SINGLE_LINE_TEXT",
-      "value": "ocr-e2e-001"
-    },
-    "text": {
-      "type": "MULTI_LINE_TEXT",
-      "value": "OCR transfer text\nInvoice total: 12800"
-    },
-    "status": {"type": "DROP_DOWN", "value": "registered"},
-    "confidence": {"type": "NUMBER", "value": 0.98},
-    "source_file": {
-      "type": "SINGLE_LINE_TEXT",
-      "value": "invoice-001.png"
-    }
-  }
+  "records": [
+    {"id": "2", "revision": "4"},
+    {"id": "3", "revision": "5"}
+  ]
 }
 ```
 
-### 更新 (`putRecord`)
-
-`document_id = ocr-e2e-001` をキーに `status` を `processed` へ更新しました。
-
-```json
-{
-  "revision": "5"
-}
-```
-
-更新後の取得では次の値になります。
+送信した更新キーは次の形です。以前の `{"document_id": {"value": ...}}` 形式は
+Kintoneの `RecordsPutUpdateKey` 契約ではありません。
 
 ```json
-{
-  "status": {"value": "processed"}
-}
+{"updateKey": {"field": "invoice_number", "value": "INV-0001"}}
 ```
 
 ### 削除 (`deleteRecords`)
 
-ID `2`, `3`, `4` を削除し、空オブジェクトが返りました。
+登録したIDをまとめて削除すると、Kintone APIと同じく空オブジェクトを返します。
 
 ```json
 {}
 ```
 
-## 5. 異常データの実際の出力
+## 6. 異常データ
 
-異常データを `postRecords`へ送信すると、MCP clientは終了コード `1` で終了し、
-次の構造化エラーを標準出力へ返します。
+fixtureには正常な帳票とは別に、次の3ケースを含みます。各リクエストは一括登録全体を
+拒否し、既存レコードを部分的に変更しません。
 
-`missing_document_id`:
+| case | 異常内容 | mock応答 |
+| --- | --- | --- |
+| `missing_invoice_number` | 必須かつ一意キーの請求書番号が空 | HTTP `400` / `MOCK_RE02` |
+| `unsupported_status` | `status` が選択肢外 | HTTP `400` / `MOCK_RE03` |
+| `confidence_out_of_range` | `ocr_confidence` が `1.2` | HTTP `400` / `MOCK_RE03` |
 
-```json
-{
-  "error": {
-    "kind": "http",
-    "operation_id": "postRecords",
-    "status_code": 400,
-    "target_code": "MOCK_RE02",
-    "message": "document_id is required"
-  }
-}
-```
+NUMBERの `value` にJSON数値を直接送るケースも拒否し、Kintone仕様どおり文字列を要求
+します。
 
-`unsupported_status`:
+## 7. 認証情報と通信エラー
 
-```json
-{
-  "error": {
-    "kind": "http",
-    "operation_id": "postRecords",
-    "status_code": 400,
-    "target_code": "MOCK_RE03",
-    "message": "status must be one of: registered, needs_review, processed"
-  }
-}
-```
+API tokenはmockのrequest historyに値を記録せず、headerの有無だけを保存します。
+削除済みrecordの取得はHTTP `404`、到達不能な転記先は構造化されたconnection errorに
+なり、tokenや機密本文をエラーへ含めません。
 
-`confidence_out_of_range`:
-
-```json
-{
-  "error": {
-    "kind": "http",
-    "operation_id": "postRecords",
-    "status_code": 400,
-    "target_code": "MOCK_RE03",
-    "message": "confidence must be between 0 and 1"
-  }
-}
-```
-
-## 6. 意図的な通信・HTTPエラー
-
-### 削除済みレコードの取得
-
-削除後にID `2` を取得すると、MCP clientの終了コードは `1` になり、次が返ります。
-
-```json
-{
-  "error": {
-    "kind": "http",
-    "operation_id": "getRecord",
-    "status_code": 404,
-    "target_code": "GAIA_RE01",
-    "message": "Record was not found"
-  }
-}
-```
-
-### 到達不能な転記先
-
-未使用portを転記先に指定すると、次のエラーになります。
-
-```json
-{
-  "error": {
-    "kind": "connection",
-    "operation_id": "getRecord",
-    "message": "could not connect to target API"
-  }
-}
-```
-
-この場合もMCP clientの終了コードは `1` です。接続先のURL、token、リクエスト
-本文はエラーメッセージに含めません。
-
-## 7. 認証情報の秘匿
-
-mockのrequest historyは、次のようにtoken headerの有無だけを記録します。
-
-```json
-{
-  "method": "POST",
-  "path": "/k/v1/records.json",
-  "status_code": 200,
-  "has_api_token": true
-}
-```
-
-`KINTONE_API_TOKEN` の値そのものはhistoryにも構造化エラーにも出力されません。
-
-## 8. 再現方法と結果
-
-リポジトリのルートから、mockとE2Eを実行します。
+## 8. 再現コマンド
 
 ```bash
 uv run pytest tests/test_kintone_stub_server.py tests/test_kintone_mcp_e2e.py -q
 ```
 
-実行結果:
+実測結果:
 
 ```text
-11 passed, 1 warning
+13 passed, 1 warning
 ```
 
-Pydantic由来のdeprecation warningは発生しません。残る1件はStarlette/AnyIOの
-依存関係にある `BlockingPortal` aliasのdeprecation warningです。
+残るwarningはStarlette / AnyIO依存関係由来のものです。

@@ -146,7 +146,24 @@ The converter uses these thresholds to determine if MCP generation should procee
 
 Both scores must meet the threshold for MCP server generation. If not met, the evaluation report will contain specific suggestions for improving your OpenAPI specification.
 
-When generated-artifact verification is enabled, a failed verification does not replace the original OpenAPI input. The generation result is marked as failed and the verification report is still written under `mcpserver/verification/`.
+Generated-artifact verification is enabled by default. A failed or `unvalidated` verification
+does not replace the original OpenAPI input. When repair is enabled, only allowlisted generated
+files are changed in isolated candidates and a candidate is adopted only after full
+reverification. The repair loop stops after at most two attempts. The generation result is
+marked as failed and the verification report is still written under `mcpserver/verification/`.
+
+The report status has the following meaning:
+
+| Status | Meaning |
+| --- | --- |
+| `passed` | All required generated operation scenarios passed. |
+| `failed` | A request, response, transport, static, or redaction check failed. |
+| `unvalidated` | The OpenAPI contract lacked enough schema information to validate a scenario. |
+| `skipped` | The scenario was intentionally excluded and the reason is recorded. |
+
+The `repair_attempts` section records the attempt number, changed allowlisted files, acceptance,
+and failure codes. Raw credentials, request bodies containing secret-like fields, and subprocess
+logs are not written to the report.
 
 ## Pre-Generated Sample Results
 
