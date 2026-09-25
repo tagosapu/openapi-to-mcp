@@ -59,6 +59,8 @@ def serialize_call_result(result: Any) -> Any:
             values.append(json.loads(text))
         except json.JSONDecodeError:
             values.append(text)
+    if not values:
+        return None
     if len(values) == 1:
         return values[0]
     return values

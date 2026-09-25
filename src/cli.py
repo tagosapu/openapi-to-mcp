@@ -238,12 +238,12 @@ def _resolve_generated_artifact_verification_settings(
     verify_enabled = (
         bool(verify_flag)
         if verify_flag is not None
-        else config.get_bool("generated_verification_enabled", False)
+        else config.get_bool("generated_verification_enabled", True)
     )
     repair_enabled = (
         bool(repair_flag)
         if repair_flag is not None
-        else config.get_bool("generated_repair_enabled", False)
+        else config.get_bool("generated_repair_enabled", True)
     )
     if repair_enabled:
         verify_enabled = True
@@ -1417,6 +1417,16 @@ async def _handle_mcp_generation(
     mcpserver_path, mcp_usage = await _generate_mcp_server(
         evaluation, openapi_spec_dict, output_config, model=model
     )
+
+    if mcp_usage.get("generation_status") == "failed":
+        if mcp_usage:
+            _update_evaluation_with_mcp_usage(
+                evaluation, mcp_usage, result, output_config, openapi_spec
+            )
+        validation_errors = mcp_usage.get("validation_errors") or [
+            "generated MCP artifact validation failed"
+        ]
+        raise MCPGenerationError(f"MCP generation failed: {validation_errors[0]}")
 
     verification_settings = _resolve_generated_artifact_verification_settings(args)
     if verification_settings["verify_enabled"]:

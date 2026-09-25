@@ -250,14 +250,16 @@ def _verify_generated_artifacts_sync(
     for scenario in scenarios:
         scenario_by_operation[scenario.operation_id].append(scenario)
 
-    secret_values = _secret_env_values()
+    base_env = _base_env(openapi_spec)
+    secret_values = _unique(
+        [*_secret_env_values(), *(_secret_env_values(base_env))]
+    )
     mock_server = OpenAPIMockServer(scenarios, secret_values=secret_values)
     server_process: subprocess.Popen[str] | None = None
 
     try:
         base_url = mock_server.start()
         mcp_port = _free_port()
-        base_env = _base_env()
         server_url = f"http://127.0.0.1:{mcp_port}/mcp/"
         server_process = _start_process(
             [
@@ -720,26 +722,37 @@ def _invoke_generated_client(
     env: Mapping[str, str],
     timeout_seconds: float,
 ) -> _ClientInvocation:
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "client.py",
-            "--transport",
-            "streamable-http",
-            "--server-url",
-            server_url,
-            "--tool",
-            tool_name,
-            "--arguments",
-            json.dumps(arguments),
-        ],
-        cwd=artifact_dir,
-        env=dict(env),
-        capture_output=True,
-        text=True,
-        timeout=max(timeout_seconds, 5.0),
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "client.py",
+                "--transport",
+                "streamable-http",
+                "--server-url",
+                server_url,
+                "--tool",
+                tool_name,
+                "--arguments",
+                json.dumps(arguments),
+            ],
+            cwd=artifact_dir,
+            env=dict(env),
+            capture_output=True,
+            text=True,
+            timeout=max(timeout_seconds, 5.0),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return _ClientInvocation(
+            returncode=124,
+            payload={
+                "error": {
+                    "kind": "timeout",
+                    "message": "generated MCP client timed out",
+                }
+            },
+        )
     try:
         payload = json.loads(completed.stdout) if completed.stdout.strip() else None
     except json.JSONDecodeError:
@@ -821,19 +834,62 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _base_env() -> dict[str, str]:
-    return {
+def _base_env(openapi_spec: Mapping[str, Any] | None = None) -> dict[str, str]:
+    environment = {
         "PATH": os.environ.get("PATH", ""),
         "NO_PROXY": "127.0.0.1,localhost,::1",
         "PYTHONUNBUFFERED": "1",
     }
+    if not isinstance(openapi_spec, Mapping):
+        return environment
+
+    components = openapi_spec.get("components", {})
+    schemes = components.get("securitySchemes", {}) if isinstance(components, Mapping) else {}
+    if not isinstance(schemes, Mapping):
+        return environment
+
+    for scheme_name, raw_scheme in schemes.items():
+        if not isinstance(raw_scheme, Mapping):
+            continue
+        normalized_name = re.sub(r"[^A-Z0-9]", "_", str(scheme_name).upper())
+        scheme_type = str(raw_scheme.get("type", ""))
+        if scheme_type == "apiKey":
+            header_name = str(raw_scheme.get("name", ""))
+            if (
+                str(scheme_name) == "apiToken"
+                or header_name.lower() == "x-cybozu-api-token"
+            ):
+                environment["KINTONE_API_TOKEN"] = "generated-verification-token"
+            elif header_name:
+                environment[f"OPENAPI_API_KEY_{normalized_name}"] = (
+                    "generated-verification-api-key"
+                )
+        elif scheme_type == "http":
+            scheme_kind = str(raw_scheme.get("scheme", "")).lower()
+            if scheme_kind == "bearer":
+                environment[f"OPENAPI_BEARER_TOKEN_{normalized_name}"] = (
+                    "generated-verification-bearer"
+                )
+            elif scheme_kind == "basic":
+                environment[f"OPENAPI_BASIC_USERNAME_{normalized_name}"] = (
+                    "generated-verification-user"
+                )
+                environment[f"OPENAPI_BASIC_PASSWORD_{normalized_name}"] = (
+                    "generated-verification-password"
+                )
+        elif scheme_type == "oauth2":
+            environment[f"OPENAPI_OAUTH_TOKEN_{normalized_name}"] = (
+                "generated-verification-oauth"
+            )
+    return environment
 
 
-def _secret_env_values() -> list[str]:
+def _secret_env_values(environ: Mapping[str, str] | None = None) -> list[str]:
+    values = environ if environ is not None else os.environ
     return _unique(
         [
             value
-            for name, value in os.environ.items()
+            for name, value in values.items()
             if value and _SECRET_ENV_NAME_PATTERN.search(name)
         ]
     )

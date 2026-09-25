@@ -220,13 +220,13 @@ def _build_error_scenarios(
             f"{operation_path}.responses.{status_code}",
         )
         validation_reasons = list(request_reasons)
-        if isinstance(raw_response, Mapping):
-            response_content = raw_response.get("content")
-            if isinstance(response_content, Mapping) and response_content:
-                validation_reasons.append(
-                    "documented HTTP error response body cannot be validated"
-                )
-                validation_reasons.extend(response_reasons)
+        has_response_content = (
+            isinstance(raw_response, Mapping)
+            and isinstance(raw_response.get("content"), Mapping)
+            and bool(raw_response["content"])
+        )
+        if has_response_content:
+            validation_reasons.extend(response_reasons)
 
         validation_status, validation_reason = _validation_fields(validation_reasons)
         scenarios.append(

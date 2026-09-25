@@ -258,6 +258,39 @@ print(json.dumps({
     assert payload["network_attempts"] == []
 
 
+def test_verifier_builds_local_credentials_for_documented_security_schemes() -> None:
+    spec = {
+        "components": {
+            "securitySchemes": {
+                "apiToken": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-Cybozu-API-Token",
+                },
+                "bearerAuth": {"type": "http", "scheme": "bearer"},
+                "basicAuth": {"type": "http", "scheme": "basic"},
+                "oauthAuth": {"type": "oauth2", "flows": {}},
+            }
+        }
+    }
+
+    environment = generated_artifact_verifier._base_env(spec)
+
+    assert environment["KINTONE_API_TOKEN"] == "generated-verification-token"
+    assert environment["OPENAPI_BEARER_TOKEN_BEARERAUTH"] == (
+        "generated-verification-bearer"
+    )
+    assert environment["OPENAPI_BASIC_USERNAME_BASICAUTH"] == (
+        "generated-verification-user"
+    )
+    assert environment["OPENAPI_BASIC_PASSWORD_BASICAUTH"] == (
+        "generated-verification-password"
+    )
+    assert environment["OPENAPI_OAUTH_TOKEN_OAUTHAUTH"] == (
+        "generated-verification-oauth"
+    )
+
+
 @pytest.mark.asyncio
 async def test_verifier_calls_each_generated_tool_against_local_mock(tmp_path) -> None:
     spec = {
@@ -493,7 +526,7 @@ async def test_verifier_maps_invalid_json_to_invalid_json(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_verifier_validates_request_body_path_query_and_flags_204_mcp_breakage(
+async def test_verifier_validates_request_body_path_query_and_accepts_204(
     tmp_path,
 ) -> None:
     spec = {
@@ -572,7 +605,7 @@ async def test_verifier_validates_request_body_path_query_and_flags_204_mcp_brea
 
     result = await verify_generated_artifacts(spec, artifact_dir, seed=7)
 
-    assert result.status == VerificationStatus.FAILED
+    assert result.status == VerificationStatus.PASSED
     assert {item.tool_name for item in result.operations} == {"createUser", "archiveUser"}
     create_result = next(item for item in result.operations if item.tool_name == "createUser")
     archive_result = next(item for item in result.operations if item.tool_name == "archiveUser")
@@ -582,10 +615,10 @@ async def test_verifier_validates_request_body_path_query_and_flags_204_mcp_brea
     assert create_result.status == VerificationStatus.PASSED
 
     assert archive_result.request_valid is True
-    assert archive_result.response_valid is False
-    assert archive_result.status == VerificationStatus.FAILED
-    assert archive_result.error_kind == "mcp"
-    assert archive_result.failure_code == "response_schema_mismatch"
+    assert archive_result.response_valid is True
+    assert archive_result.status == VerificationStatus.PASSED
+    assert archive_result.error_kind is None
+    assert archive_result.failure_code is None
 
 
 @pytest.mark.asyncio
@@ -811,3 +844,29 @@ async def test_verifier_redacts_secret_query_and_opaque_body_values_in_report(
     assert query_secret not in serialized
     assert body_secret not in serialized
     assert "[REDACTED]" in serialized
+
+
+def test_invoke_generated_client_converts_subprocess_timeout_to_error(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["client.py"], timeout=5)
+
+    monkeypatch.setattr(generated_artifact_verifier.subprocess, "run", raise_timeout)
+
+    invocation = generated_artifact_verifier._invoke_generated_client(
+        tmp_path,
+        "http://127.0.0.1:9001/mcp/",
+        "getRecord",
+        {"id": 1},
+        {"PATH": os.environ.get("PATH", "")},
+        1.0,
+    )
+
+    assert invocation.returncode == 124
+    assert invocation.payload == {
+        "error": {
+            "kind": "timeout",
+            "message": "generated MCP client timed out",
+        }
+    }

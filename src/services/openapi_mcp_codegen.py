@@ -586,7 +586,7 @@ def _render_tool_function(
 
     lines = [
         "@mcp.tool()",
-        f"def {operation.tool_name}({signature}) -> dict[str, Any]:",
+        f"def {operation.tool_name}({signature}) -> Any:",
         f"    \"\"\"Call {operation.method} {operation.path}.\"\"\"",
         "    arguments: dict[str, Any] = {",
     ]
@@ -729,17 +729,17 @@ uv run python results/azure/openapi/mcpserver/server.py \\
 ### 端末3: 生成MCPクライアント
 
 クライアントの接続先はサーバーの `/mcp/` endpointです。OCR fixtureは
-`examples/ocr/kintone-transfer.json` にあり、正常データ3件と異常データ3件を確認できます。
-次のコマンドは正常データの1件目をKintoneの `postRecords` toolへ送信する例です。
+`examples/ocr/kintone-transfer.json` にあり、正常データ2件と異常データ3件を確認できます。
+請求書のフィールド変換と一括登録・更新は、リポジトリのKintone E2Eで検証します。
 
 ```bash
-uv run python results/azure/openapi/mcpserver/client.py \\
-    --server-url http://127.0.0.1:9001/mcp/ \\
-    --tool postRecords \\
-    --arguments '{{"body":{{"app":1,"records":[{{"document_id":{{"type":"SINGLE_LINE_TEXT","value":"ocr-e2e-001"}},"text":{{"type":"MULTI_LINE_TEXT","value":"OCR transfer text\\nInvoice total: 12800"}},"status":{{"type":"DROP_DOWN","value":"registered"}},"confidence":{{"type":"NUMBER","value":0.98}},"source_file":{{"type":"SINGLE_LINE_TEXT","value":"invoice-001.png"}}}}]}}}}'
+uv run pytest tests/test_kintone_stub_server.py tests/test_kintone_mcp_e2e.py -q
 ```
 
 `--tool` を省略するとツール一覧を取得します。別の明示的なAPI endpointへ接続する
 場合は、`API_BASE_URL` または `--base-url` を設定してください。異常データの期待結果と
 正常系の実際の出力は `docs/KINTONE_MCP_MOCK_RESULTS.md` を参照してください。
+
+生成CLIで自動検証を有効にすると、固定seedのschemaベースmock検証と限定修正の結果が
+`mcpserver/verification/`へ保存されます。請求書fixtureの業務検証は上記E2Eで行います。
 """

@@ -135,10 +135,10 @@ def test_generated_artifact_verification_settings_clamp_repair_attempts():
 def test_config_defaults_include_safe_generated_verification_keys():
     loader = ConfigLoader(config_dir="config")
 
-    assert loader.get_bool("generated_verification_enabled", True) is False
+    assert loader.get_bool("generated_verification_enabled", False) is True
     assert loader.get_int("generated_verification_seed", -1) == 0
     assert loader.get_int("generated_verification_timeout_seconds", -1) == 30
-    assert loader.get_bool("generated_repair_enabled", True) is False
+    assert loader.get_bool("generated_repair_enabled", False) is True
     assert loader.get_int("generated_repair_max_attempts", -1) == 2
 
 
@@ -149,7 +149,7 @@ async def test_handle_mcp_generation_verifies_generated_artifacts_when_flag_enab
     args = SimpleNamespace(
         eval_only=False,
         verify_generated=True,
-        repair_generated=None,
+        repair_generated=False,
         generated_verification_seed=13,
         generated_repair_attempts=None,
     )
@@ -310,7 +310,7 @@ async def test_handle_mcp_generation_repair_implies_verification(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-async def test_handle_mcp_generation_skips_generated_verification_by_default(
+async def test_handle_mcp_generation_verifies_and_repairs_by_default(
     monkeypatch, tmp_path
 ):
     args = SimpleNamespace(eval_only=False)
@@ -339,16 +339,26 @@ async def test_handle_mcp_generation_skips_generated_verification_by_default(
             )
         ),
     )
-    verify_mock = AsyncMock(side_effect=AssertionError("verification should not run"))
-    repairer_factory = MagicMock(
-        side_effect=AssertionError("repairer should not be created")
+    repairer = MagicMock(repair=AsyncMock())
+    repairer_factory = MagicMock(return_value=repairer)
+    verify_mock = AsyncMock(
+        return_value=GeneratedArtifactVerificationResult(
+            artifact_dir=str(mcpserver_dir),
+            spec_sha256="abc",
+            generator_version="0.1.0",
+            seed=0,
+            status=VerificationStatus.PASSED,
+            attempts=1,
+            operations=[],
+            repair_attempts=[],
+            failures=[],
+        )
     )
     monkeypatch.setattr(cli, "_create_generated_artifact_repairer", repairer_factory)
-    monkeypatch.setattr(cli, "verify_generated_artifacts", verify_mock)
     monkeypatch.setattr(
         cli,
         "verify_with_repair",
-        AsyncMock(side_effect=AssertionError("repair verification should not run")),
+        verify_mock,
     )
     monkeypatch.setattr(
         cli,
@@ -361,8 +371,9 @@ async def test_handle_mcp_generation_skips_generated_verification_by_default(
     )
 
     assert path == mcpserver_dir
-    assert verify_mock.await_count == 0
-    repairer_factory.assert_not_called()
+    repairer_factory.assert_called_once_with()
+    verify_mock.assert_awaited_once()
+    assert verify_mock.await_args.kwargs["repairer"] is repairer
 
 
 @pytest.mark.asyncio
@@ -372,7 +383,7 @@ async def test_failed_generated_verification_marks_generation_failed_and_writes_
     args = SimpleNamespace(
         eval_only=False,
         verify_generated=True,
-        repair_generated=None,
+        repair_generated=False,
         generated_verification_seed=7,
         generated_repair_attempts=None,
     )
